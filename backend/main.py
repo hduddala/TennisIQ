@@ -8,12 +8,13 @@ import os
 import re
 import json
 import math
+import uuid
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,11 +43,15 @@ except ModuleNotFoundError:
 import db
 import modal_runner
 
+load_dotenv()
+
 YOUTUBE_URL_RE = re.compile(
     r"^https?://(?:www\.|m\.)?(?:youtube\.com/watch\?.*v=|youtu\.be/|youtube\.com/embed/)[\w-]+",
     re.IGNORECASE,
 )
 MIN_UPLOAD_BYTES = 10_240  # 10 KB
+# Align with Next.js proxy limit (see frontend/next.config.ts)
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(512 * 1024 * 1024)))
 
 
 def is_valid_youtube_url(url: str) -> bool:
@@ -55,26 +60,37 @@ def is_valid_youtube_url(url: str) -> bool:
 
 def validate_video_file(file_path: str) -> tuple[bool, str]:
     """Open an uploaded MP4 with OpenCV and verify it contains readable video frames."""
-    import cv2
+    try:
+        import cv2
+    except ImportError:
+        logging.error(
+            "opencv-python-headless is not installed; cannot validate uploads",
+        )
+        return False, (
+            "Server is missing video libraries (OpenCV). "
+            "Install backend dependencies: pip install opencv-python-headless"
+        )
 
-    cap = cv2.VideoCapture(file_path)
-    if not cap.isOpened():
+    try:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            cap.release()
+            return False, "The uploaded file could not be opened as a video. It may be corrupted or not a valid MP4."
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 1:
+            cap.release()
+            return False, "The uploaded video contains no frames. It may be corrupted or empty."
+
+        ret, frame = cap.read()
         cap.release()
-        return False, "The uploaded file could not be opened as a video. It may be corrupted or not a valid MP4."
+        if not ret or frame is None:
+            return False, "The uploaded video exists but no frames could be read. The file may be corrupted."
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames < 1:
-        cap.release()
-        return False, "The uploaded video contains no frames. It may be corrupted or empty."
-
-    ret, frame = cap.read()
-    cap.release()
-    if not ret or frame is None:
-        return False, "The uploaded video exists but no frames could be read. The file may be corrupted."
-
-    return True, ""
-
-load_dotenv()
+        return True, ""
+    except Exception as exc:
+        logging.warning("OpenCV validation error for %s: %s", file_path, exc)
+        return False, "Could not read the video file. Try re-encoding to H.264 MP4 or MOV."
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -211,65 +227,114 @@ async def ingest_url(request: IngestURLRequest):
 
 @app.post("/ingest/upload")
 async def ingest_upload(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     config: str = Form(default="{}"),
 ):
     """
-    Accept an MP4 file upload as fallback when YouTube ingestion fails.
-    Saves file, creates job, spawns Modal pipeline with local file path.
+    Accept an MP4/MOV upload, save to disk (streamed — not loaded fully into RAM),
+    create a job, and spawn the Modal pipeline with file:// path.
     """
     allowed_ext = (".mp4", ".mov", ".mkv", ".webm")
     if not file.filename or not file.filename.lower().endswith(allowed_ext):
-        raise HTTPException(status_code=400, detail=f"Unsupported file type. Allowed: {', '.join(allowed_ext)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Allowed: {', '.join(allowed_ext)}",
+        )
 
-    upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-    os.makedirs(upload_dir, exist_ok=True)
+    upload_dir = os.path.abspath(
+        os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "uploads"))
+    )
+    try:
+        os.makedirs(upload_dir, exist_ok=True)
+    except OSError as exc:
+        logger.exception("Cannot create upload directory %s", upload_dir)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Server cannot create upload directory: {exc}",
+        ) from exc
 
     try:
         parsed_config = {**DEFAULT_CONFIG, **json.loads(config)}
     except json.JSONDecodeError:
         parsed_config = DEFAULT_CONFIG
 
-    import uuid
-    safe_name = f"{uuid.uuid4()}.mp4"
+    ext = Path(file.filename).suffix.lower() or ".mp4"
+    if ext not in allowed_ext:
+        ext = ".mp4"
+    safe_name = f"{uuid.uuid4()}{ext}"
     file_path = os.path.join(upload_dir, safe_name)
-
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    file_size = os.path.getsize(file_path)
-    if file_size < MIN_UPLOAD_BYTES:
-        os.remove(file_path)
-        raise HTTPException(
-            status_code=400,
-            detail=f"The uploaded file is too small ({file_size} bytes). Please upload a valid tennis match MP4.",
-        )
-
-    valid, reason = validate_video_file(file_path)
-    if not valid:
-        os.remove(file_path)
-        raise HTTPException(status_code=400, detail=reason)
-
-    job_id = db.create_job(
-        footage_url=f"file://{os.path.abspath(file_path)}",
-        footage_type="upload",
-        config=parsed_config
-    )
+    job_committed = False
 
     try:
-        modal_runner.spawn_pipeline(
-            job_id=job_id,
-            footage_url=f"file://{os.path.abspath(file_path)}",
-            config=parsed_config,
-            backend_url=BACKEND_URL,
-        )
-    except Exception as e:
-        db.set_error(job_id, f"Failed to start pipeline: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        chunk_size = 1024 * 1024
+        total_written = 0
+        with open(file_path, "wb") as out:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                total_written += len(chunk)
+                if total_written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
+                    )
+                out.write(chunk)
 
-    return {"job_id": job_id, "status": "queued"}
+        if total_written < MIN_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The uploaded file is too small ({total_written} bytes). "
+                    "Please upload a valid tennis match MP4."
+                ),
+            )
+
+        valid, reason = validate_video_file(file_path)
+        if not valid:
+            raise HTTPException(status_code=400, detail=reason)
+
+        job_id = db.create_job(
+            footage_url=f"file://{os.path.abspath(file_path)}",
+            footage_type="upload",
+            config=parsed_config,
+        )
+        job_committed = True
+
+        try:
+            modal_runner.spawn_pipeline(
+                job_id=job_id,
+                footage_url=f"file://{os.path.abspath(file_path)}",
+                config=parsed_config,
+                backend_url=BACKEND_URL,
+            )
+        except Exception as e:
+            logger.exception("spawn_pipeline failed for job %s", job_id)
+            db.set_error(job_id, f"Failed to start pipeline: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to start pipeline: {str(e)}",
+            ) from e
+
+        return {"job_id": job_id, "status": "queued"}
+    except HTTPException:
+        if not job_committed and os.path.isfile(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        raise
+    except Exception as e:
+        logger.exception("ingest_upload failed")
+        if not job_committed and os.path.isfile(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail=str(e) or "Upload failed on the server.",
+        ) from e
 
 
 @app.get("/status/{job_id}")

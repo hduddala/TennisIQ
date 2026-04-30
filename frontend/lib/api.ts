@@ -22,6 +22,29 @@ function ensureAbsoluteUrl(baseUrl: string, path: string): string {
   return `${baseUrl}${safePath}`;
 }
 
+function formatApiError(res: Response, text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return res.statusText || `HTTP ${res.status}`;
+  try {
+    const j = JSON.parse(trimmed) as { detail?: unknown };
+    const d = j.detail;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) {
+      const parts = d
+        .map((x: unknown) =>
+          typeof x === "object" && x !== null && "msg" in x
+            ? String((x as { msg: string }).msg)
+            : String(x),
+        )
+        .filter(Boolean);
+      if (parts.length) return parts.join("; ");
+    }
+  } catch {
+    /* use raw text */
+  }
+  return trimmed;
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const apiUrl = API_BASE;
   let res: Response;
@@ -38,7 +61,7 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`API error ${res.status}: ${text}`);
+    throw new Error(`API error ${res.status}: ${formatApiError(res, text)}`);
   }
   return res.json() as Promise<T>;
 }
@@ -84,7 +107,7 @@ export async function ingestUpload(file: File): Promise<{ job_id: string; status
   }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Upload error ${res.status}: ${text}`);
+    throw new Error(`Upload error ${res.status}: ${formatApiError(res, text)}`);
   }
   return res.json();
 }
