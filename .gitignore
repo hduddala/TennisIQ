@@ -1,8 +1,16 @@
 # ── Credentials & secrets ─────────────────────────────────────────────────────
+# Never commit real API keys or tokens — use *.example files only.
 .env
 .env.*
 !.env.example
 !.env.local.example
+.env.local
+.env.production.local
+.env.development.local
+credentials.json
+*-credentials.json
+**/serviceAccount*.json
+.vercel/
 *.pem
 *.key
 *.crt
@@ -20,6 +28,8 @@ checkpoints/
 # ── Pipeline outputs & uploads ────────────────────────────────────────────────
 outputs/
 backend/uploads/
+# Local sample videos / PDFs (large)
+input/
 
 # ── Databases ─────────────────────────────────────────────────────────────────
 *.db
