@@ -27,7 +27,14 @@ image = (
 )
 
 
-@app.function(gpu="T4", timeout=600, image=image)
+@app.function(
+    gpu="A10G",       # A10G is ~3-4× faster than T4 for vision workloads
+    timeout=300,      # 5 min per segment is plenty on A10G (was 600 on T4)
+    image=image,
+    # min_containers=1,  # uncomment in production to eliminate cold-start (~$26/day on A10G)
+    # For development: cold start adds ~30-45s to the first segment only.
+    max_containers=50,  # allow up to 50 parallel segments for long matches
+)
 def run_court_and_ball(
     video_bytes: bytes,
     fps: float,

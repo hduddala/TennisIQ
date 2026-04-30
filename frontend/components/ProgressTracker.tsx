@@ -7,9 +7,42 @@ interface Props {
   status: StatusResponse;
 }
 
+function pipelineProgressPercent(status: StatusResponse): number {
+  if (status.status === "complete") {
+    return 100;
+  }
+
+  const denom = STAGE_ORDER.length - 1;
+  const idx = STAGE_ORDER.indexOf(status.stage);
+  const stageProgress = idx >= 0 ? (idx / denom) * 100 : 0;
+
+  const total = status.segments_total ?? 0;
+  const complete = status.segments_complete ?? 0;
+  const current = status.segment_current;
+
+  // During Modal segment inference, stage index stays on "inference" for dozens of segments.
+  // Drive the bar primarily by 1-based segment position so it visibly advances (e.g. 7/50 ≈ 22%).
+  if (status.stage === "inference" && total > 0 && current != null && current >= 1) {
+    const t = Math.max(total, 1);
+    const byIndex = 14 + ((current - 0.35) / t) * 62;
+    const byComplete = 14 + (complete / t) * 62;
+    return Math.round(Math.min(92, Math.max(stageProgress, byIndex, byComplete)));
+  }
+
+  if (total > 0) {
+    let frac = complete / total;
+    const segmentMapped = 15 + frac * 55;
+    return Math.round(Math.min(99, Math.max(stageProgress, segmentMapped)));
+  }
+
+  return Math.round(stageProgress);
+}
+
 export default function ProgressTracker({ status }: Props) {
   const currentIdx = STAGE_ORDER.indexOf(status.stage);
-  const progress = currentIdx >= 0 ? Math.round((currentIdx / (STAGE_ORDER.length - 1)) * 100) : 0;
+  const progress = pipelineProgressPercent(status);
+  const segTotal = status.segments_total ?? 0;
+  const segDone = status.segments_complete ?? 0;
 
   return (
     <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-6 space-y-5">
@@ -42,6 +75,16 @@ export default function ProgressTracker({ status }: Props) {
             {STAGE_LABELS[status.stage] ?? status.stage}
           </p>
           <p className="text-xs text-zinc-500 mt-0.5">{status.stage_description}</p>
+          {status.stage === "inference" && segTotal > 0 && (
+            <p className="text-xs text-zinc-600 mt-1">
+              {status.gpu_backend === "modal" && (
+                <span className="text-zinc-500 block mb-0.5">
+                  Running on Modal A10G — all {segTotal} segment{segTotal !== 1 ? "s" : ""} dispatched in parallel.
+                </span>
+              )}
+              {segDone}/{segTotal} complete. All segments run simultaneously — total expected ~2–4 min for a 5-min clip.
+            </p>
+          )}
         </div>
       </div>
 

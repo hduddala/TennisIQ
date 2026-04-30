@@ -1,9 +1,12 @@
 """
 TennisIQ pipeline runner.
 
-Sends each 10-second video segment to the Modal GPU function (tennisiq-court)
-for inference. Accumulates results across all segments into merged output files.
-Reports progress back to the FastAPI backend via /status/update.
+Sends all video segments to Modal GPU *in parallel* via fn.spawn(), then
+collects results as they complete. Reports per-segment progress back to the
+FastAPI backend via /status/update.
+
+GPU: A10G (Modal).  Parallelism: all segments run simultaneously.
+Expected total time for a 5-7 min clip: ~2-4 minutes end-to-end.
 """
 import os
 import json
@@ -12,6 +15,7 @@ import logging
 import shutil
 import tempfile
 import threading
+import concurrent.futures
 from pathlib import Path
 
 import requests
@@ -19,7 +23,9 @@ import requests
 logger = logging.getLogger(__name__)
 
 OUTPUTS_DIR = os.getenv("OUTPUTS_DIR", os.path.join(os.path.dirname(__file__), "..", "outputs"))
-SEGMENT_DURATION = 10.0
+# 30s segments: for a 5-min clip → 10 parallel GPU calls.
+# All run simultaneously — total time ≈ slowest single segment, not sum.
+SEGMENT_DURATION = 30.0
 
 JSON_MERGE_LIST_FILES = {"events.json", "points.json", "coaching_cards.json"}
 JSON_MERGE_DICT_FILES = {"stats.json", "run.json"}
@@ -70,37 +76,109 @@ def _post_status(backend_url: str, **kwargs):
         logger.warning(f"Status post failed: {e}")
 
 
-def _run_segment_on_modal(
+def _get_modal_fn():
+    """Resolve the Modal function handle, raising a clear error if not deployed."""
+    import modal
+    try:
+        return modal.Function.from_name("tennisiq-court", "run_court_and_ball")
+    except Exception as e:
+        if "not found" in str(e).lower() or "tennisiq-court" in str(e):
+            raise RuntimeError(
+                "Modal app 'tennisiq-court' is not deployed. From the TennisIQ directory run: "
+                "python -m modal deploy tennisiq/modal_court.py  (or ./deploy_modal.sh)"
+            ) from e
+        raise
+
+
+def _run_segments_parallel(
+    segments: list[dict],
     video_bytes: bytes,
     fps: float,
-    start_sec: float,
-    end_sec: float,
-) -> dict:
-    """Run a single 10-second segment on Modal T4 GPU, with local CPU fallback."""
-    try:
-        import modal
-        fn = modal.Function.from_name("tennisiq-court", "run_court_and_ball")
-        return fn.remote(
+    backend_url: str,
+    job_id: str,
+    out_dir: "Path",
+    accum: "ResultAccumulator",
+) -> tuple[int, int, list[str]]:
+    """
+    Spawn all segments on Modal A10G GPU simultaneously.
+
+    Returns (succeeded, failed, segment_errors).
+    Progress status is posted to backend as each segment completes.
+    """
+    fn = _get_modal_fn()
+    n_segments = len(segments)
+
+    spawns: list[tuple[dict, object]] = []
+    for seg in segments:
+        call = fn.spawn(
             video_bytes=video_bytes,
             fps=fps,
-            start_sec=start_sec,
-            end_sec=end_sec,
+            start_sec=seg["start_sec"],
+            end_sec=seg["end_sec"],
         )
-    except Exception as modal_err:
-        logger.warning(f"Modal unavailable ({modal_err}), running locally on CPU...")
-        import sys
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        os.environ.setdefault("TENNISIQ_CHECKPOINT_ROOT",
-                              os.path.join(project_root, "checkpoints"))
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        from tennisiq.modal_court import run_court_and_ball
-        return run_court_and_ball.local(
-            video_bytes=video_bytes,
-            fps=fps,
-            start_sec=start_sec,
-            end_sec=end_sec,
+        spawns.append((seg, call))
+        logger.info(
+            "Job %s: spawned segment %s/%s (%.0fs–%.0fs) on Modal A10G",
+            job_id, seg["idx"] + 1, n_segments, seg["start_sec"], seg["end_sec"],
         )
+
+    _post_status(
+        backend_url, job_id=job_id, stage="inference",
+        description=(
+            f"All {n_segments} segment(s) dispatched to Modal A10G in parallel — "
+            "collecting results as each GPU worker finishes..."
+        ),
+        status="running",
+    )
+
+    # ── Collect completions in parallel via a thread pool ────────────────────
+    succeeded = 0
+    failed = 0
+    segment_errors: list[str] = []
+    lock = threading.Lock()
+
+    def _collect_one(item: tuple[dict, object]) -> tuple[int, dict | None, str | None]:
+        seg, call = item
+        try:
+            result = call.get(timeout=420)  # 7 min hard cap per segment
+            return seg["idx"], result, None
+        except Exception as exc:
+            return seg["idx"], None, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_segments, 50)) as pool:
+        future_map = {pool.submit(_collect_one, item): item[0] for item in spawns}
+        for future in concurrent.futures.as_completed(future_map):
+            seg_idx, result, err = future.result()
+            seg = segments[seg_idx]
+
+            with lock:
+                if err is None:
+                    accum.ingest_segment(seg_idx, result)
+                    succeeded += 1
+                    completed_so_far = succeeded
+                    _post_status(
+                        backend_url, job_id=job_id, stage="inference",
+                        description=(
+                            f"Segment {seg_idx + 1}/{n_segments} complete "
+                            f"({result.get('frames_processed', '?')} frames, "
+                            f"{result.get('timing', {}).get('total', '?')}s on GPU). "
+                            f"{completed_so_far}/{n_segments} done."
+                        ),
+                        status="running",
+                        segment_complete={"idx": seg_idx, "result_key": str(out_dir)},
+                    )
+                    logger.info("Job %s: segment %s/%s complete", job_id, seg_idx + 1, n_segments)
+                else:
+                    failed += 1
+                    segment_errors.append(f"Segment {seg_idx + 1}: {err}")
+                    logger.error("Job %s: segment %s/%s failed: %s", job_id, seg_idx + 1, n_segments, err)
+                    _post_status(
+                        backend_url, job_id=job_id, stage="inference",
+                        description=f"Segment {seg_idx + 1}/{n_segments} failed: {err}",
+                        status="running",
+                    )
+
+    return succeeded, failed, segment_errors
 
 
 # ── Segment result accumulator ────────────────────────────────────────────────
@@ -681,52 +759,16 @@ def _run_pipeline(
             video_bytes = f.read()
 
         accum = ResultAccumulator(out_dir)
-        succeeded = 0
-        failed = 0
-        segment_errors = []
 
-        for seg in segments:
-            seg_idx = seg["idx"]
-            _post_status(
-                backend_url, job_id=job_id,
-                stage="inference",
-                description=f"Running inference on segment {seg_idx + 1}/{n_segments} "
-                            f"({seg['start_sec']:.0f}s–{seg['end_sec']:.0f}s) on Modal T4 GPU...",
-                status="running",
-            )
-
-            try:
-                result = _run_segment_on_modal(
-                    video_bytes=video_bytes,
-                    fps=fps,
-                    start_sec=seg["start_sec"],
-                    end_sec=seg["end_sec"],
-                )
-
-                accum.ingest_segment(seg_idx, result)
-                succeeded += 1
-
-                _post_status(
-                    backend_url, job_id=job_id,
-                    stage="inference",
-                    description=f"Segment {seg_idx + 1}/{n_segments} complete "
-                                f"({result.get('frames_processed', '?')} frames, "
-                                f"{result.get('timing', {}).get('total', '?')}s on GPU).",
-                    status="running",
-                    segment_complete={"idx": seg_idx, "result_key": str(out_dir)},
-                )
-
-            except Exception as e:
-                failed += 1
-                err_msg = str(e)
-                segment_errors.append(f"Segment {seg_idx + 1}: {err_msg}")
-                logger.error(f"Segment {seg_idx} failed: {e}")
-                _post_status(
-                    backend_url, job_id=job_id,
-                    stage="inference",
-                    description=f"Segment {seg_idx + 1}/{n_segments} failed: {err_msg}",
-                    status="running",
-                )
+        succeeded, failed, segment_errors = _run_segments_parallel(
+            segments=segments,
+            video_bytes=video_bytes,
+            fps=fps,
+            backend_url=backend_url,
+            job_id=job_id,
+            out_dir=out_dir,
+            accum=accum,
+        )
 
         if succeeded > 0:
             _post_status(backend_url, job_id=job_id, stage="generating_outputs",

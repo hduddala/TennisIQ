@@ -42,6 +42,14 @@ export interface StatusResponse {
   latest_eval: EvalResult | null;
   created_at: string;
   updated_at: string;
+  /** Modal GPU segments: total registered in DB (0 until after segmenting). */
+  segments_total?: number;
+  /** Segments finished successfully so far. */
+  segments_complete?: number;
+  /** 1-based index from status text while a segment is running (optional). */
+  segment_current?: number;
+  /** Where heavy inference runs (not the local Mac). */
+  gpu_backend?: string;
 }
 
 export interface Artifact {
@@ -248,6 +256,17 @@ export interface ServePlacement {
   service_boxes: Record<string, { x_min: number; y_min: number; x_max: number; y_max: number }>;
 }
 
+export interface HeatmapData {
+  grid: number[][];
+  x_edges: number[];
+  y_edges: number[];
+  total_out_bounces?: number;
+  total_frames?: number;
+  positions?: { x: number; y: number }[];
+  /** Court half used for heatmap filtering (near = camera baseline side, high Y). */
+  primary_side?: "near" | "far";
+}
+
 export interface StatSummary {
   mean?: number | null;
   median?: number | null;
@@ -276,6 +295,8 @@ export interface AnalysisData {
     };
     events_total?: number;
     points_total?: number;
+    hits_total?: number;
+    notes?: string[];
   };
   serve?: {
     zone_counts?: Record<string, number>;
@@ -330,6 +351,22 @@ export interface AnalysisData {
       direction_change_deg?: number | null;
       player?: string | null;
     }[];
+  };
+  shots?: {
+    timeline?: {
+      t?: number | null;
+      frame_idx?: number;
+      point_idx?: number | null;
+      player?: string | null;
+      side?: string | null;
+      shot_type?: string | null; // serve | groundstroke | volley | unknown
+      speed_kmh?: number | null;
+    }[];
+    mix?: {
+      player_a?: { counts?: Record<string, number>; pct?: Record<string, number> };
+      player_b?: { counts?: Record<string, number>; pct?: Record<string, number> };
+      unknown?: { counts?: Record<string, number>; pct?: Record<string, number> };
+    };
   };
 }
 

@@ -933,6 +933,345 @@ def _build_player_card(label: str, pa: dict, patterns: list) -> dict:
     }
 
 
+def generate_insights(
+    analysis: dict,
+    points: list,
+    events: list,
+) -> dict:
+    """
+    Rule-based coaching insights engine.
+
+    Returns a dict with keys:
+      strengths, issues, patterns, drills, priority, coach_summary
+    Each insight is a dict with 'title' and 'detail' (and 'evidence' for issues).
+    """
+    strengths: list[dict] = []
+    issues: list[dict] = []
+    patterns: list[dict] = []
+    drills: list[dict] = []
+
+    # ── Pull key metrics ────────────────────────────────────────────────────────
+    rally = analysis.get("rally") or {}
+    serve = analysis.get("serve") or {}
+    ball = analysis.get("ball") or {}
+    players_data = analysis.get("players") or {}
+    shots = analysis.get("shots") or {}
+    errors = analysis.get("errors") or {}
+
+    rally_hits = rally.get("rally_hits") or []
+    n_points = len(points)
+    avg_rally = sum(rally_hits) / len(rally_hits) if rally_hits else 0
+    end_reasons = [p.get("end_reason") for p in points if isinstance(p, dict)]
+    out_count = end_reasons.count("OUT")
+    net_count = end_reasons.count("NET")
+    double_bounce_count = end_reasons.count("DOUBLE_BOUNCE")
+    ball_lost_count = end_reasons.count("BALL_LOST")
+    out_rate = out_count / n_points if n_points else 0
+    net_rate = net_count / n_points if n_points else 0
+
+    # Long rally performance (6+ shots)
+    long_rally_pts = [p for p in points if isinstance(p, dict) and (p.get("rally_hit_count") or 0) >= 6]
+    long_rally_errors = [p for p in long_rally_pts if p.get("end_reason") == "OUT"]
+    long_rally_error_rate = len(long_rally_errors) / len(long_rally_pts) if long_rally_pts else 0
+
+    # Short rally (1–3 shots) — often serve-dominant play
+    short_rally_pts = [p for p in points if isinstance(p, dict) and (p.get("rally_hit_count") or 0) <= 3]
+
+    # Serve zone diversity
+    serve_zone_counts: dict[str, int] = serve.get("zone_counts") or {}
+    n_zones_used = len(serve_zone_counts)
+    fault_rate = serve.get("fault_rate") or 0.0
+    total_serves = serve.get("sample_count") or 0
+
+    # Ball speed
+    speed_stats = ball.get("speed_stats") or {}
+    avg_speed_kmh = (speed_stats.get("mean") or 0) * 3.6
+    peak_speed_kmh = (speed_stats.get("p95") or 0) * 3.6
+
+    # Player movement
+    pa_stats = players_data.get("player_a") or {}
+    pb_stats = players_data.get("player_b") or {}
+    pa_distance = pa_stats.get("distance_m") or 0
+    pb_distance = pb_stats.get("distance_m") or 0
+    pa_zones = pa_stats.get("zone_time_pct") or {}
+    pb_zones = pb_stats.get("zone_time_pct") or {}
+    pa_baseline_pct = pa_zones.get("baseline", 0)
+    pb_net_pct = pb_zones.get("net", 0)
+
+    # Shot types
+    shot_mix = shots.get("mix") or {}
+    pa_shots = (shot_mix.get("player_a") or {}).get("counts") or {}
+    pb_shots = (shot_mix.get("player_b") or {}).get("counts") or {}
+
+    # Hit/bounce events analysis
+    hit_events = [e for e in events if isinstance(e, dict) and e.get("event_type") == "hit"]
+    bounce_events = [e for e in events if isinstance(e, dict) and e.get("event_type") == "bounce"]
+    out_bounces = [e for e in bounce_events if e.get("in_out") == "out"]
+    in_bounces = [e for e in bounce_events if e.get("in_out") == "in"]
+    far_hits = [h for h in hit_events if h.get("court_side") == "far"]
+    near_hits = [h for h in hit_events if h.get("court_side") == "near"]
+    pa_hit_count = sum(1 for h in hit_events if h.get("player") == "player_a")
+    pb_hit_count = sum(1 for h in hit_events if h.get("player") == "player_b")
+
+    # ── STRENGTHS ───────────────────────────────────────────────────────────────
+
+    # Good serve accuracy
+    if total_serves >= 2 and (fault_rate or 0) < 0.15:
+        strengths.append({
+            "title": "Reliable first serve",
+            "detail": f"Only {round((fault_rate or 0)*100)}% fault rate across {total_serves} detected serve(s) — good accuracy and placement control.",
+        })
+
+    # Good rally consistency
+    if 4 <= avg_rally <= 9 and n_points >= 3:
+        strengths.append({
+            "title": "Solid rally consistency",
+            "detail": f"Average rally length of {avg_rally:.1f} shots shows players can sustain exchanges and aren't making quick unforced errors.",
+        })
+    elif avg_rally >= 10:
+        strengths.append({
+            "title": "Strong endurance baseline",
+            "detail": f"Average {avg_rally:.1f} shots per rally demonstrates excellent court endurance and the ability to control extended exchanges.",
+        })
+
+    # Low error rate
+    if n_points >= 4 and out_rate < 0.25:
+        strengths.append({
+            "title": "Good margin control",
+            "detail": f"Only {round(out_rate*100)}% of points end in out balls — players are keeping the ball in play consistently.",
+        })
+
+    # Active court coverage
+    if pa_distance > 50:
+        strengths.append({
+            "title": "Active court movement",
+            "detail": f"Player A covered {round(pa_distance)}m — demonstrates strong physical presence and court awareness.",
+        })
+
+    # Winner production
+    if double_bounce_count > 0 and n_points >= 4:
+        winner_rate = double_bounce_count / n_points
+        if winner_rate >= 0.15:
+            strengths.append({
+                "title": "Winner production",
+                "detail": f"{round(winner_rate*100)}% of points end in outright winners (double bounce) — good aggressive shot selection.",
+            })
+
+    # Serve variety
+    if n_zones_used >= 3:
+        strengths.append({
+            "title": "Serve variety",
+            "detail": f"Serves spread across {n_zones_used} zones — unpredictable placement makes it harder for opponents to anticipate.",
+        })
+
+    # ── ISSUES ──────────────────────────────────────────────────────────────────
+
+    # High unforced error rate
+    if n_points >= 4 and out_rate > 0.40:
+        issues.append({
+            "title": "Excessive unforced errors",
+            "detail": f"{round(out_rate*100)}% of rallies end with a ball going out — players are over-hitting or losing depth control under pressure.",
+            "evidence": f"{out_count} out of {n_points} tracked points ended OUT.",
+        })
+
+    # Net errors
+    if n_points >= 4 and net_rate > 0.20:
+        issues.append({
+            "title": "Net clearance issues",
+            "detail": f"{round(net_rate*100)}% of points end with the ball hitting the net — contact point or swing path needs adjustment.",
+            "evidence": f"{net_count} net errors detected.",
+        })
+
+    # Struggles in long rallies
+    if len(long_rally_pts) >= 3 and long_rally_error_rate > 0.55:
+        issues.append({
+            "title": "Breaks down in long rallies",
+            "detail": f"{round(long_rally_error_rate*100)}% of rallies lasting 6+ shots end in errors — consistency drops significantly under extended pressure.",
+            "evidence": f"{len(long_rally_errors)} errors out of {len(long_rally_pts)} long-rally points.",
+        })
+
+    # Predictable serve
+    if n_zones_used == 1 and total_serves >= 3:
+        zone_name = list(serve_zone_counts.keys())[0].replace("_", " ")
+        issues.append({
+            "title": "Predictable serve direction",
+            "detail": f"All {total_serves} serves went to the same zone ({zone_name}) — a pattern this consistent is easy for experienced opponents to anticipate and attack.",
+            "evidence": f"100% of serves to {zone_name}.",
+        })
+    elif n_zones_used == 2 and total_serves >= 5:
+        issues.append({
+            "title": "Limited serve variety",
+            "detail": f"Serves spread across only {n_zones_used} zones — adding more placement options (wide, body, T-serve) will keep opponents guessing.",
+            "evidence": f"Zones used: {', '.join(serve_zone_counts.keys())}.",
+        })
+
+    # Never comes to net
+    if pa_baseline_pct > 85 and pa_distance > 20:
+        issues.append({
+            "title": "Stays too deep (Player A)",
+            "detail": f"Player A spends {round(pa_baseline_pct)}% of time near the baseline — very rarely pressures from the net, making it easy for opponents to reset.",
+            "evidence": "Net zone time < 15% of tracked frames.",
+        })
+
+    # Serve fault rate
+    if total_serves >= 3 and (fault_rate or 0) > 0.35:
+        issues.append({
+            "title": "High serve fault rate",
+            "detail": f"{round((fault_rate or 0)*100)}% fault rate on tracked serves — double faults cost free points and mental momentum.",
+            "evidence": f"Fault rate: {round((fault_rate or 0)*100)}%.",
+        })
+
+    # ── PATTERNS ────────────────────────────────────────────────────────────────
+
+    # Dominant hitting side
+    if len(near_hits) > 0 and len(far_hits) > 0:
+        near_pct = len(near_hits) / (len(near_hits) + len(far_hits)) * 100
+        if near_pct > 65:
+            patterns.append({
+                "title": "Baseline-dominant play style",
+                "detail": f"{round(near_pct)}% of shots are hit from the near (baseline) side — a defensive, grind-it-out style that favors consistency over aggression.",
+            })
+        elif near_pct < 35:
+            patterns.append({
+                "title": "Aggressive, net-oriented play",
+                "detail": f"Only {round(near_pct)}% of shots from the baseline — players are taking the ball early and finishing points at the net.",
+            })
+
+    # Short rally tendency
+    short_pct = len(short_rally_pts) / n_points * 100 if n_points else 0
+    if short_pct > 50:
+        patterns.append({
+            "title": "Short rallies dominate",
+            "detail": f"{round(short_pct)}% of points end within 3 shots — matches tend to be decided by serve, return, and one-punch aggression rather than extended rallies.",
+        })
+
+    # Player A hits more than Player B
+    if pa_hit_count > 0 and pb_hit_count > 0:
+        total_assigned = pa_hit_count + pb_hit_count
+        pa_pct = pa_hit_count / total_assigned * 100
+        if pa_pct > 60:
+            patterns.append({
+                "title": "Player A controls the rallies",
+                "detail": f"Player A accounts for {round(pa_pct)}% of assigned shots — dictating play and putting pressure on Player B to respond.",
+            })
+        elif pa_pct < 40:
+            patterns.append({
+                "title": "Player B controls the rallies",
+                "detail": f"Player B accounts for {round(100-pa_pct)}% of assigned shots — dictating the tempo and forcing Player A into a reactive role.",
+            })
+
+    # Speed pattern
+    if avg_speed_kmh > 80:
+        patterns.append({
+            "title": "High-tempo ball striking",
+            "detail": f"Average ball speed of {round(avg_speed_kmh)} km/h indicates a power-oriented game. This puts time pressure on opponents but requires consistent technique to control.",
+        })
+    elif 20 < avg_speed_kmh < 60 and len(ball.get("speed_samples_m_s") or []) >= 10:
+        patterns.append({
+            "title": "Moderate pace — control-first style",
+            "detail": f"Average ball speed of {round(avg_speed_kmh)} km/h suggests a tactical, placement-focused approach rather than power hitting.",
+        })
+
+    # ── DRILLS ──────────────────────────────────────────────────────────────────
+
+    if out_rate > 0.35:
+        drills.append({
+            "name": "Target zone depth control",
+            "description": "Place 4 cones 1m inside each baseline. Rally with the goal of hitting inside the cones every shot. Start slow, increase pace only when consistent.",
+            "targets": "Reduces unforced errors, builds depth awareness.",
+        })
+
+    if long_rally_error_rate > 0.5 and len(long_rally_pts) >= 2:
+        drills.append({
+            "name": "20-shot rally challenge",
+            "description": "Partner rally with the target of completing 20 consecutive shots cross-court without error. If you hit out, restart. Builds mental focus under extended pressure.",
+            "targets": "Long rally consistency and pressure tolerance.",
+        })
+
+    if n_zones_used <= 2 and total_serves >= 2:
+        drills.append({
+            "name": "Serve placement to 3 zones",
+            "description": "Practice serving to wide (T-junction), body, and center ('T') in rotation. Use a target cone in each zone. Goal: hit each zone 5 times before moving on.",
+            "targets": "Serve variety, keeps opponents off-balance.",
+        })
+
+    if pa_baseline_pct > 80:
+        drills.append({
+            "name": "Approach-and-volley patterns",
+            "description": "Feed yourself a short ball (inside service line), approach with a deep crosscourt shot, then come to the net and volley the next ball away. Repeat 15 reps.",
+            "targets": "Develops net confidence and point-finishing from mid-court.",
+        })
+
+    if net_rate > 0.15:
+        drills.append({
+            "name": "Net clearance shadow swings",
+            "description": "Shadow-swing groundstrokes focusing on brushing up the back of the ball to generate topspin. Use a string or line at net-height as visual feedback.",
+            "targets": "Reduces net errors by improving spin and swing path.",
+        })
+
+    if len(short_rally_pts) / n_points > 0.5 if n_points else False:
+        drills.append({
+            "name": "Crosscourt sustain drill",
+            "description": "Two players rally only crosscourt for 3-minute sets. No winners allowed — the goal is keeping every ball deep and in play. Score: count consecutive in-court balls.",
+            "targets": "Rally building, baseline consistency, patience.",
+        })
+
+    # ── PRIORITY & SUMMARY ───────────────────────────────────────────────────────
+
+    # Pick the single highest-priority issue
+    priority = "Continue developing consistency and patterns — all fundamentals look solid."
+    if issues:
+        top_issue = issues[0]
+        priority = f"{top_issue['title']}: {top_issue['detail'].split('.')[0]}."
+
+    # Coach summary
+    summaries: list[str] = []
+    if n_points >= 10:
+        action_verb = "analyzing" if n_points < 30 else "reviewing"
+        summaries.append(
+            f"After {action_verb} {n_points} tracked points with an average rally of {avg_rally:.1f} shots"
+        )
+    else:
+        summaries.append(f"From {n_points} tracked points")
+
+    if out_rate > 0.4:
+        summaries.append(
+            f"the most urgent priority is error reduction — {round(out_rate*100)}% of rallies end in unforced errors."
+        )
+    elif long_rally_error_rate > 0.55 and long_rally_pts:
+        summaries.append(
+            "the player performs well early in rallies but breaks down when extended beyond 5–6 shots."
+        )
+    elif strengths:
+        summaries.append(
+            f"the overall picture is encouraging: {strengths[0]['title'].lower()} stands out as a genuine strength."
+        )
+    else:
+        summaries.append("there is a solid foundation to build on.")
+
+    if drills:
+        summaries.append(
+            f"Focus first on {drills[0]['name'].lower()} to address the most impactful area."
+        )
+
+    coach_summary = " ".join(summaries)
+
+    return {
+        "strengths": strengths[:4],
+        "issues": issues[:4],
+        "patterns": patterns[:3],
+        "drills": drills[:4],
+        "priority": priority,
+        "coach_summary": coach_summary,
+        "data_points": {
+            "points_analyzed": n_points,
+            "avg_rally": _safe_round(avg_rally, 1),
+            "out_rate_pct": round(out_rate * 100, 1),
+            "long_rally_error_rate_pct": round(long_rally_error_rate * 100, 1) if long_rally_pts else None,
+            "serve_zones_used": n_zones_used,
+        },
+    }
+
 def write_analysis_bundle(run_dir: Path, analysis: dict | None) -> None:
     if analysis is None:
         return

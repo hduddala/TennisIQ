@@ -5,6 +5,7 @@ Handles jobs, stage updates, point-level coach feedback, session persistence, an
 import sqlite3
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -445,6 +446,35 @@ def get_all_segments(job_id: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_segment_progress(job_id: str) -> dict[str, int]:
+    """Counts for GPU segment work (Modal). Used for honest progress in the UI."""
+    with get_connection() as conn:
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM segment_status WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        done_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM segment_status WHERE job_id=? AND status='complete'",
+            (job_id,),
+        ).fetchone()
+    total = int(total_row["n"]) if total_row else 0
+    complete = int(done_row["n"]) if done_row else 0
+    return {"segments_total": total, "segments_complete": complete}
+
+
+_SEGMENT_DESC_RE = re.compile(r"segment\s+(\d+)/(\d+)", re.IGNORECASE)
+
+
+def parse_segment_position_from_description(description: str | None) -> tuple[int | None, int | None]:
+    """Parse 'segment 5/50' from Modal runner status text (1-based current, total)."""
+    if not description:
+        return None, None
+    m = _SEGMENT_DESC_RE.search(description)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
 def save_point_feedback(job_id: str, point_idx: int, action: str, note: Optional[str] = None) -> None:
     """Save or update coach feedback for a single detected point (FR-31/33).
 
@@ -871,7 +901,24 @@ def get_full_status(job_id: str) -> Optional[dict]:
     decisions = get_decisions(job_id)
     eval_results = get_eval_results(job_id)
     latest_eval = eval_results[-1] if eval_results else None
-    return {
+    seg = get_segment_progress(job_id)
+    cur_1, desc_total = parse_segment_position_from_description(job.get("stage_description"))
+    desc = job.get("stage_description") or ""
+
+    segments_total = seg["segments_total"]
+    segments_complete = seg["segments_complete"]
+    if desc_total is not None and desc_total > 0 and segments_total <= 0:
+        segments_total = desc_total
+
+    # When segment_status rows are missing (failed /status/update batch, wrong DB, etc.),
+    # still infer completed count from the runner's human-readable description.
+    if job.get("stage") == "inference" and cur_1 is not None and desc_total is not None:
+        if "Running inference" in desc:
+            segments_complete = max(segments_complete, cur_1 - 1)
+        elif re.search(r"segment\s+\d+/\d+\s+complete", desc, re.IGNORECASE) and "failed" not in desc.lower():
+            segments_complete = max(segments_complete, cur_1)
+
+    payload = {
         "job_id": job_id,
         "status": job["status"],
         "stage": job["stage"],
@@ -882,4 +929,10 @@ def get_full_status(job_id: str) -> Optional[dict]:
         "latest_eval": latest_eval,
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
+        "segments_total": segments_total,
+        "segments_complete": segments_complete,
+        "gpu_backend": "modal",
     }
+    if cur_1 is not None and desc_total is not None:
+        payload["segment_current"] = cur_1
+    return payload

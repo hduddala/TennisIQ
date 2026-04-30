@@ -1,31 +1,31 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef, use } from "react";
+import { useEffect, useState, useCallback, use } from "react";
 import Link from "next/link";
-import { getStatus, getResultsData, getCoachNotes } from "@/lib/api";
+import { getStatus, getResultsData, getApiBaseUrl } from "@/lib/api";
 import type {
   StatusResponse,
   ResultsDataResponse,
   DetectedPoint,
-  PlayerCard,
-  ShotEvent,
   CoachingCard,
-  AnalyticsData,
+  ServePlacement,
+  HeatmapData,
   AnalysisData,
-  CoachNote,
 } from "@/lib/types";
-import { STAGE_LABELS } from "@/lib/types";
 import ProgressTracker from "@/components/ProgressTracker";
 import CheckpointReview from "@/components/CheckpointReview";
-import PointClipViewer from "@/components/PointClipViewer";
-import PDFExport from "@/components/PDFExport";
-import PlayerCardView from "@/components/PlayerCardView";
-import WeaknessReport from "@/components/WeaknessReport";
-import MatchCharts from "@/components/MatchCharts";
-import HistoricalInsightsCard from "@/components/HistoricalInsightsCard";
+import OverlayPlayer from "@/components/OverlayPlayer";
+import PointDeck from "@/components/PointDeck";
+import ServePlacementChart from "@/components/ServePlacementChart";
+import HeatmapViewer from "@/components/HeatmapViewer";
+import CourtMiniMap from "@/components/CourtMiniMap";
+import AnalysisDashboard from "@/components/AnalysisDashboard";
+import ResultsHeader from "@/components/ResultsHeader";
+import SessionSummary from "@/components/SessionSummary";
+import AICoach from "@/components/AICoach";
+import ShotTrajectoryMap from "@/components/ShotTrajectoryMap";
 
 const POLL_INTERVAL = 5000;
-const API_URL = (process.env.NEXT_PUBLIC_API_URL || "").trim().replace(/\/+$/, "") || "/backend";
 
 export default function ResultsPage({
   params,
@@ -35,11 +35,32 @@ export default function ResultsPage({
   const { jobId } = use(params);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [data, setData] = useState<ResultsDataResponse | null>(null);
-  const [notes, setNotes] = useState<CoachNote[]>([]);
+  const [seekTo, setSeekTo] = useState<number | null>(null);
+  const [playerLabels, setPlayerLabels] = useState<{ a: string; b: string }>({
+    a: "Player A",
+    b: "Player B",
+  });
+  const [editingLabels, setEditingLabels] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Which point the user wants to jump to (driven by weakness evidence clicks / momentum clicks)
-  const [focusPointIdx, setFocusPointIdx] = useState<number | null>(null);
-  const pointClipsRef = useRef<HTMLDivElement>(null);
+  const [apiUrl, setApiUrl] = useState<string>("");
+
+  useEffect(() => {
+    let active = true;
+    getApiBaseUrl()
+      .then((url) => { if (active) setApiUrl(url); })
+      .catch(() => { if (active) setApiUrl(""); });
+    return () => { active = false; };
+  }, []);
+
+  const withApi = useCallback(
+    (path: string | null | undefined): string | undefined => {
+      if (!path) return undefined;
+      if (/^https?:\/\//i.test(path)) return path;
+      if (!path.startsWith("/")) return path;
+      return apiUrl ? `${apiUrl}${path}` : path;
+    },
+    [apiUrl],
+  );
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -49,10 +70,6 @@ export default function ResultsPage({
         if (s.status === "complete") {
           const d = await getResultsData(jobId);
           setData(d);
-          try {
-            const nr = await getCoachNotes(jobId);
-            setNotes(nr.notes);
-          } catch { /* no notes yet */ }
         }
         return false;
       }
@@ -81,13 +98,10 @@ export default function ResultsPage({
     };
   }, [fetchStatus]);
 
-  // Scroll to point clips and set focus index when a user clicks an evidence/momentum link
-  const handlePointFocus = useCallback((idx: number) => {
-    setFocusPointIdx(idx);
-    setTimeout(() => {
-      pointClipsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 50);
-  }, []);
+  const handleSeekToPoint = (sec: number) => {
+    setSeekTo(sec);
+    setTimeout(() => setSeekTo(null), 100);
+  };
 
   if (error) {
     return (
@@ -109,7 +123,7 @@ export default function ResultsPage({
   if (!status) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <div className="text-zinc-500 text-sm">Loading pipeline status...</div>
+        <div className="text-zinc-500 text-sm">Loading...</div>
       </div>
     );
   }
@@ -119,26 +133,20 @@ export default function ResultsPage({
   const isError = status.status === "error";
   const isRunning = !isComplete && !isReview && !isError;
 
+  const overlayVideoUrl = withApi(data?.overlay_video_url);
   const points: DetectedPoint[] = data?.points ?? [];
-  const clipBaseUrl = `${API_URL}/outputs/${jobId}/clips`;
-
-  const rawVideoUrl = data?.raw_video_url
-    ? (data.raw_video_url.startsWith("/") ? `${API_URL}${data.raw_video_url}` : data.raw_video_url)
-    : undefined;
-  const overlayVideoUrl = data?.overlay_video_url
-    ? (data.overlay_video_url.startsWith("/") ? `${API_URL}${data.overlay_video_url}` : data.overlay_video_url)
-    : undefined;
-
-  const playerACard: PlayerCard | null = data?.player_a_card ?? null;
-  const playerBCard: PlayerCard | null = data?.player_b_card ?? null;
-  const analyticsData: AnalyticsData | null = data?.analytics ?? null;
-  const analysisBundle: AnalysisData | null = data?.analysis ?? null;
-  const historicalInsights = data?.historical_insights ?? null;
+  const coachingCards: CoachingCard[] = data?.coaching_cards ?? [];
+  const servePlacement: ServePlacement | null = data?.serve_placement ?? null;
+  const errorHeatmap: HeatmapData | null = data?.error_heatmap ?? null;
+  const playerAHeatmap: HeatmapData | null = data?.player_a_heatmap ?? null;
+  const playerBHeatmap: HeatmapData | null = data?.player_b_heatmap ?? null;
+  const clipBaseUrl = withApi(`/outputs/${jobId}/clips`) ?? `/outputs/${jobId}/clips`;
+  const analysis: AnalysisData | null = (data?.analysis as AnalysisData | null | undefined) ?? null;
 
   return (
     <div className="min-h-screen bg-black text-white">
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <header className="border-b border-zinc-800 px-6 py-4 flex items-center justify-between">
+      {/* Header */}
+      <header className="border-b border-zinc-900 px-6 py-4 flex items-center justify-between">
         <Link href="/" className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-xl bg-green-600 flex items-center justify-center text-sm font-black text-white">
             T
@@ -147,17 +155,17 @@ export default function ResultsPage({
             Tennis<span className="text-green-400">IQ</span>
           </span>
         </Link>
-        <div className="flex items-center gap-2 text-sm">
+        <div className="flex items-center gap-3">
           <StatusBadge status={status.status} />
-          <span className="text-zinc-500 font-mono text-xs">{jobId.slice(0, 8)}</span>
+          <span className="text-zinc-600 font-mono text-xs">{jobId.slice(0, 8)}</span>
         </div>
       </header>
 
-      <div className="max-w-7xl mx-auto px-4 py-8 space-y-10">
-        {/* Error banner */}
+      <div className="max-w-6xl mx-auto px-4 py-8 space-y-8">
+
         {isError && (
           <div className="bg-red-950 border border-red-800 rounded-2xl p-6">
-            <h2 className="text-red-300 font-bold mb-2">Pipeline Error</h2>
+            <h2 className="text-red-300 font-bold mb-2">Analysis failed</h2>
             <p className="text-red-400 text-sm">{status.error_message || "An unexpected error occurred."}</p>
           </div>
         )}
@@ -165,125 +173,239 @@ export default function ResultsPage({
         {isRunning && <ProgressTracker status={status} />}
         {isReview && <CheckpointReview jobId={jobId} onComplete={fetchStatus} />}
 
-        {/* ── 1. Full Match Video: Raw + CV Overlay side by side (Top) ─────── */}
-        {isComplete && (rawVideoUrl || overlayVideoUrl) && (
-          <div className="space-y-3">
-            <h3 className="text-base font-semibold text-white px-1">Full Match</h3>
-            <div
-              className={`grid gap-4 ${rawVideoUrl && overlayVideoUrl ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1"}`}
-            >
-              {rawVideoUrl && (
-                <div className="space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-500 uppercase tracking-wider px-1">
-                    Raw Footage
-                  </span>
-                  <div className="rounded-xl overflow-hidden bg-zinc-900 border border-zinc-800">
-                    <video src={rawVideoUrl} className="w-full aspect-video" controls playsInline>
-                      <track kind="captions" />
-                    </video>
-                  </div>
-                </div>
-              )}
-              {overlayVideoUrl && (
-                <div className="space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-500 uppercase tracking-wider px-1">
-                    CV Detection Overlay
-                  </span>
-                  <div className="rounded-xl overflow-hidden bg-zinc-900 border border-green-500/20">
-                    <video src={overlayVideoUrl} className="w-full aspect-video" controls playsInline>
-                      <track kind="captions" />
-                    </video>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ── 2. Player Cards ─────────────────────────────────────────────── */}
-        {isComplete && (playerACard || playerBCard) && (
-          <PlayerCardView
-            playerACard={playerACard}
-            playerBCard={playerBCard}
-            analytics={analyticsData}
-          />
-        )}
-
-        {isComplete && <HistoricalInsightsCard history={historicalInsights} />}
-
-        {/* ── 3. Weakness Report (clickable evidence → jump to clip) ───────── */}
-        {isComplete && (playerACard || playerBCard) && points.length > 0 && (
-          <WeaknessReport
-            playerACard={playerACard}
-            playerBCard={playerBCard}
-            points={points}
-            onEvidenceClick={handlePointFocus}
-          />
-        )}
-
-        {/* ── 4. Match Trends (rally length + momentum, momentum is clickable) */}
-        {isComplete && points.length > 0 && (
-          <MatchCharts
-            points={points}
-            analytics={analyticsData}
-            onPointClick={handlePointFocus}
-          />
-        )}
-
-        {/* ── 5. Point Clips + Coach Notes ────────────────────────────────── */}
-        {isComplete && points.length > 0 && (
-          <div ref={pointClipsRef} id="point-clips-section" className="scroll-mt-6">
-            <PointClipViewer
-              jobId={jobId}
-              points={points}
-              clipBaseUrl={clipBaseUrl}
-              rawVideoUrl={rawVideoUrl}
-              initialPointIdx={focusPointIdx}
-            />
-          </div>
-        )}
-
-        {/* ── 6. Export Report (PDF) ──────────────────────────────────────── */}
         {isComplete && (
-          <div className="border-t border-zinc-800 pt-8">
-            <div className="flex flex-col items-center gap-2 text-center mb-4">
-              <h3 className="text-base font-semibold text-white">Export Coach Report</h3>
-              <p className="text-xs text-zinc-500">
-                Full point breakdown, weakness analysis, and coach notes — formatted for players to take to practice.
-              </p>
+          <div className="space-y-8">
+
+            {/* ── 1. Match summary stats + report button ── */}
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1">
+                <ResultsHeader data={data!} analysis={analysis} />
+              </div>
+              <a
+                href={`/report/${jobId}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="shrink-0 flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 hover:border-green-500/40 text-sm text-white font-medium transition-all"
+              >
+                <svg className="w-4 h-4 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3M3 17V7a2 2 0 012-2h6l2 2h4a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>
+                </svg>
+                Download Report
+              </a>
             </div>
-            <div className="flex justify-center">
-              <PDFExport
-                playerACard={playerACard}
-                playerBCard={playerBCard}
-                analytics={analyticsData}
-                analysis={analysisBundle}
-                notes={notes}
-                points={points}
-                shots={data?.shots ?? []}
-                coachingCards={data?.coaching_cards ?? []}
-                jobId={jobId}
-              />
+
+            {/* ── 2. Video + live court mini-map + heatmaps ── */}
+            <VideoCourtSection
+              overlayVideoUrl={overlayVideoUrl}
+              seekTo={seekTo}
+              jobId={jobId}
+              apiBase={apiUrl}
+              servePlacement={servePlacement}
+              errorHeatmap={errorHeatmap}
+              playerAHeatmap={playerAHeatmap}
+              playerBHeatmap={playerBHeatmap}
+              playerLabels={playerLabels}
+            />
+
+            {/* ── 3. Player names ── */}
+            <div className="flex items-center gap-4">
+              {editingLabels ? (
+                <form
+                  className="flex items-center gap-2"
+                  onSubmit={(e) => { e.preventDefault(); setEditingLabels(false); }}
+                >
+                  <input
+                    className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-white w-32 focus:outline-none focus:border-green-500/50"
+                    value={playerLabels.a}
+                    onChange={(e) => setPlayerLabels((l) => ({ ...l, a: e.target.value }))}
+                    placeholder="Player A"
+                  />
+                  <span className="text-zinc-600 text-sm">vs</span>
+                  <input
+                    className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-white w-32 focus:outline-none focus:border-green-500/50"
+                    value={playerLabels.b}
+                    onChange={(e) => setPlayerLabels((l) => ({ ...l, b: e.target.value }))}
+                    placeholder="Player B"
+                  />
+                  <button type="submit" className="text-sm text-green-400 hover:text-green-300 px-2">
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingLabels(false)}
+                    className="text-sm text-zinc-500 hover:text-zinc-300 px-2"
+                  >
+                    Cancel
+                  </button>
+                </form>
+              ) : (
+                <>
+                  <span className="text-sm text-white font-semibold">{playerLabels.a}</span>
+                  <span className="text-zinc-600 text-sm">vs</span>
+                  <span className="text-sm text-white font-semibold">{playerLabels.b}</span>
+                  <button
+                    onClick={() => setEditingLabels(true)}
+                    className="text-xs text-zinc-600 hover:text-zinc-300 transition-colors ml-1"
+                  >
+                    Rename
+                  </button>
+                </>
+              )}
             </div>
+
+            {/* ── 4. AI coaching insights ── */}
+            {apiUrl && <AICoach jobId={jobId} apiBase={apiUrl} />}
+
+            {/* ── 5. Coaching summary (key takeaways) ── */}
+            <SessionSummary data={data!} analysis={analysis} />
+
+            {/* ── 6. Shot breakdown + speed analysis ── */}
+            {analysis && <ShotTrajectoryMap analysis={analysis} />}
+
+            {/* ── 7. Detailed analytics (shots, movement, pace) ── */}
+            {analysis && <AnalysisDashboard analysis={analysis} />}
+
+            {/* ── 8. Point-by-point — collapsible, closed by default ── */}
+            <CollapsiblePoints
+              points={points}
+              coachingCards={coachingCards}
+              clipBaseUrl={clipBaseUrl}
+              onSeekToPoint={handleSeekToPoint}
+              playerLabels={playerLabels}
+            />
+
           </div>
         )}
+
       </div>
+    </div>
+  );
+}
+
+// Collapsible wrapper for the point-by-point deck.
+// Closed by default so the detailed analytics appear first without scrolling past 100+ point cards.
+function CollapsiblePoints({
+  points,
+  coachingCards,
+  clipBaseUrl,
+  onSeekToPoint,
+  playerLabels,
+}: {
+  points: DetectedPoint[];
+  coachingCards: CoachingCard[];
+  clipBaseUrl: string;
+  onSeekToPoint: (sec: number) => void;
+  playerLabels: { a: string; b: string };
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="rounded-2xl border border-zinc-800 bg-zinc-900 overflow-hidden">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between px-5 py-4 hover:bg-zinc-800/50 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <h2 className="text-base font-semibold text-white">Points</h2>
+          {points.length > 0 && (
+            <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-zinc-800 text-zinc-400">
+              {points.length}
+            </span>
+          )}
+        </div>
+        <span className="text-zinc-500 text-sm select-none">
+          {open ? "▲ Hide" : "▼ Show all points"}
+        </span>
+      </button>
+      {open && (
+        <div className="border-t border-zinc-800 p-4">
+          <PointDeck
+            points={points}
+            coachingCards={coachingCards}
+            clipBaseUrl={clipBaseUrl}
+            onSeekToPoint={onSeekToPoint}
+            playerLabels={playerLabels}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// Isolated sub-component so that currentVideoTime state updates (60 fps from
+// video timeupdate) only re-render this section, not the entire results page.
+function VideoCourtSection({
+  overlayVideoUrl,
+  seekTo,
+  jobId,
+  apiBase,
+  servePlacement,
+  errorHeatmap,
+  playerAHeatmap,
+  playerBHeatmap,
+  playerLabels,
+}: {
+  overlayVideoUrl: string | undefined;
+  seekTo: number | null;
+  jobId: string;
+  apiBase: string;
+  servePlacement: ServePlacement | null;
+  errorHeatmap: HeatmapData | null;
+  playerAHeatmap: HeatmapData | null;
+  playerBHeatmap: HeatmapData | null;
+  playerLabels: { a: string; b: string };
+}) {
+  const [currentTime, setCurrentTime] = useState(0);
+
+  return (
+    <div className="space-y-4">
+      {/* Video player */}
+      <OverlayPlayer
+        overlayVideoUrl={overlayVideoUrl}
+        seekTo={seekTo}
+        onTimeUpdate={setCurrentTime}
+      />
+
+      {/* Live court tracking mini-map — full width, landscape orientation */}
+      {apiBase && (
+        <CourtMiniMap
+          jobId={jobId}
+          apiBase={apiBase}
+          currentTime={currentTime}
+          playerALabel={playerLabels.a}
+          playerBLabel={playerLabels.b}
+        />
+      )}
+
+      {/* Serve placement + heatmaps */}
+      {(servePlacement || playerAHeatmap || playerBHeatmap || errorHeatmap) && (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <ServePlacementChart data={servePlacement} />
+          <HeatmapViewer
+            errorHeatmap={errorHeatmap}
+            playerAHeatmap={playerAHeatmap}
+            playerBHeatmap={playerBHeatmap}
+            compact
+          />
+        </div>
+      )}
     </div>
   );
 }
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
-    queued: "bg-zinc-800 text-zinc-400",
-    running: "bg-blue-950 text-blue-400",
-    awaiting_point_review: "bg-yellow-950 text-yellow-400",
-    finalizing: "bg-blue-950 text-blue-400",
-    complete: "bg-green-950 text-green-400",
-    error: "bg-red-950 text-red-400",
+    queued:                 "bg-zinc-800 text-zinc-400",
+    running:                "bg-blue-950 text-blue-400",
+    awaiting_point_review:  "bg-yellow-950 text-yellow-400",
+    finalizing:             "bg-blue-950 text-blue-400",
+    complete:               "bg-green-950 text-green-400",
+    error:                  "bg-red-950 text-red-400",
   };
   return (
-    <span className={`px-2 py-1 rounded-lg text-xs font-medium ${colors[status] ?? "bg-zinc-800 text-zinc-400"}`}>
-      {STAGE_LABELS[status] ?? status}
+    <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${colors[status] ?? "bg-zinc-800 text-zinc-400"}`}>
+      {status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, " ")}
     </span>
   );
 }

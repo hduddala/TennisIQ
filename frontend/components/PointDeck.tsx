@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useMemo } from "react";
 import type { CoachingCard, DetectedPoint } from "@/lib/types";
 
 type Props = {
@@ -7,113 +8,152 @@ type Props = {
   coachingCards: CoachingCard[];
   clipBaseUrl: string;
   onSeekToPoint: (sec: number) => void;
+  playerLabels?: { a: string; b: string };
 };
 
-const END_COLORS: Record<string, string> = {
-  OUT: "bg-red-500/15 text-red-300 border-red-500/30",
-  NET: "bg-yellow-500/15 text-yellow-300 border-yellow-500/30",
-  DOUBLE_BOUNCE: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-  BALL_LOST: "bg-zinc-500/15 text-zinc-300 border-zinc-500/30",
+type FilterKey = "all" | "long_rally" | "errors" | "serve";
+
+const END_LABEL: Record<string, { text: string; cls: string }> = {
+  OUT:           { text: "Out",         cls: "text-red-400" },
+  NET:           { text: "Net",         cls: "text-orange-400" },
+  DOUBLE_BOUNCE: { text: "Winner",      cls: "text-green-400" },
+  BALL_LOST:     { text: "Unfinished",  cls: "text-zinc-500" },
 };
 
-function badge(text: string, cls: string) {
-  return (
-    <span className={`text-[10px] px-1.5 py-0.5 rounded border ${cls}`}>
-      {text}
-    </span>
-  );
+function endLabel(reason: string | null | undefined) {
+  if (!reason) return { text: "–", cls: "text-zinc-500" };
+  return END_LABEL[reason] ?? { text: reason.replace(/_/g, " ").toLowerCase(), cls: "text-zinc-400" };
 }
 
-function findCard(pointIdx: number, cards: CoachingCard[]): CoachingCard | undefined {
+function findCard(pointIdx: number, cards: CoachingCard[]) {
   return cards.find((c) => c.point_idx === pointIdx);
 }
 
-function pointVideoUrl(pointIdx: number, base: string) {
-  return `${base}/point_${pointIdx}.mp4`;
-}
+const FILTER_LABELS: Record<FilterKey, string> = {
+  all: "All",
+  long_rally: "Long rallies",
+  errors: "Errors",
+  serve: "Serve points",
+};
 
-export default function PointDeck({ points, coachingCards, clipBaseUrl, onSeekToPoint }: Props) {
+export default function PointDeck({ points, coachingCards, clipBaseUrl, onSeekToPoint, playerLabels }: Props) {
+  const [filter, setFilter] = useState<FilterKey>("all");
+  const labels = playerLabels ?? { a: "Player A", b: "Player B" };
+
+  const filtered = useMemo(() => {
+    switch (filter) {
+      case "long_rally": return points.filter((p) => p.rally_hit_count >= 4);
+      case "errors":     return points.filter((p) => p.end_reason === "OUT" || p.end_reason === "NET");
+      case "serve":      return points.filter((p) => p.serve_zone != null);
+      default:           return points;
+    }
+  }, [points, filter]);
+
   if (!points.length) return null;
 
-  const groups: Record<string, DetectedPoint[]> = {};
-  points.forEach((p) => {
-    const key = p.end_reason || "UNKNOWN";
-    groups[key] = groups[key] || [];
-    groups[key].push(p);
-  });
+  const filterCount: Record<FilterKey, number> = {
+    all:        points.length,
+    long_rally: points.filter((p) => p.rally_hit_count >= 4).length,
+    errors:     points.filter((p) => p.end_reason === "OUT" || p.end_reason === "NET").length,
+    serve:      points.filter((p) => p.serve_zone != null).length,
+  };
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between px-1">
-        <h3 className="text-sm font-semibold text-zinc-300">Points</h3>
-        <span className="text-[11px] text-zinc-500">{points.length} total</span>
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-base font-bold text-white mr-2">Points</h3>
+        {(Object.entries(FILTER_LABELS) as [FilterKey, string][]).map(([key, label]) => {
+          if (key !== "all" && filterCount[key] === 0) return null;
+          return (
+            <button
+              key={key}
+              onClick={() => setFilter(key)}
+              className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
+                filter === key
+                  ? "bg-green-600 border-green-600 text-white font-medium"
+                  : "border-zinc-800 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+              }`}
+            >
+              {label}
+              {key !== "all" && (
+                <span className="ml-1.5 opacity-60">{filterCount[key]}</span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
-      {Object.entries(groups).map(([reason, pts]) => (
-        <div key={reason} className="space-y-3">
-          <div className="text-xs uppercase tracking-wide text-zinc-500 px-1">
-            {reason.replace("_", " ")} ({pts.length})
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-            {pts.map((pt) => {
-              const dur = (pt.end_sec - pt.start_sec).toFixed(1);
-              const confPct = Math.round(pt.confidence * 100);
-              const card = findCard(pt.point_idx, coachingCards);
-              const clipUrl = pointVideoUrl(pt.point_idx, clipBaseUrl);
-              return (
-                <div
-                  key={pt.point_idx}
-                  className="rounded-xl bg-zinc-900 border border-zinc-800 hover:border-zinc-700 transition-colors overflow-hidden flex flex-col"
-                >
-                  <div className="p-3 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-white">P{pt.point_idx}</span>
-                      {badge(reason.replace("_", " ").toLowerCase(), END_COLORS[reason] ?? END_COLORS.BALL_LOST)}
-                      {pt.serve_fault_type && badge(`${pt.serve_fault_type} fault`, "bg-red-500/10 text-red-300 border-red-500/20")}
-                      {badge(`${confPct}% conf`, confPct >= 70 ? "bg-green-500/10 text-green-300 border-green-500/20" : confPct >= 40 ? "bg-yellow-500/10 text-yellow-300 border-yellow-500/20" : "bg-red-500/10 text-red-300 border-red-500/20")}
-                    </div>
-                    <div className="flex flex-wrap gap-3 text-[11px] text-zinc-500">
-                      <span>{pt.rally_hit_count} hits</span>
-                      <span>{pt.bounce_count} bounces</span>
-                      <span>{dur}s</span>
-                      {pt.serve_zone && <span>serve: {pt.serve_zone.replace("_", " ")}</span>}
-                      {pt.serve_player && <span>{pt.serve_player}</span>}
-                    </div>
-                    {card && (
-                      <div className="text-xs text-zinc-300 leading-snug">
-                        {card.summary}
-                      </div>
-                    )}
-                    {card && (
-                      <div className="bg-green-500/5 border border-green-500/15 rounded-lg px-3 py-2 text-[11px] text-green-400 leading-snug">
-                        {card.suggestion}
-                      </div>
-                    )}
-                  </div>
-                  <div className="bg-black/40">
-                    <video
-                      className="w-full h-40 object-cover bg-black cursor-pointer"
-                      muted
-                      controls
-                      onPlay={() => onSeekToPoint(pt.start_sec)}
-                      src={clipUrl}
-                    />
-                    <div className="flex items-center justify-between px-3 py-2 text-[11px] text-zinc-500">
-                      <span>Clip</span>
-                      <button
-                        onClick={() => onSeekToPoint(pt.start_sec)}
-                        className="text-zinc-300 hover:text-white"
-                      >
-                        Jump
-                      </button>
-                    </div>
-                  </div>
+      {filtered.length === 0 ? (
+        <div className="text-sm text-zinc-600 py-6 text-center">No points match this filter.</div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+          {filtered.map((pt) => {
+            const dur = (pt.end_sec - pt.start_sec).toFixed(1);
+            const card = findCard(pt.point_idx, coachingCards);
+            const clipUrl = `${clipBaseUrl}/point_${pt.point_idx}.mp4`;
+            const end = endLabel(pt.end_reason);
+            const serveZone = pt.serve_zone?.replace(/_/g, " ") ?? null;
+            const server =
+              pt.serve_player === "player_a" ? labels.a
+              : pt.serve_player === "player_b" ? labels.b
+              : null;
+
+            return (
+              <div
+                key={pt.point_idx}
+                className="rounded-2xl bg-zinc-900 border border-zinc-800 hover:border-zinc-700 transition-colors overflow-hidden flex flex-col"
+              >
+                {/* Clip video - top of card */}
+                <div className="bg-black">
+                  <video
+                    className="w-full aspect-video object-cover cursor-pointer"
+                    muted
+                    controls
+                    preload="none"
+                    onPlay={() => onSeekToPoint(pt.start_sec)}
+                    src={clipUrl}
+                  />
                 </div>
-              );
-            })}
-          </div>
+
+                {/* Point info */}
+                <div className="p-4 space-y-3 flex-1 flex flex-col">
+                  {/* Header row */}
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-sm font-bold text-white">Point {pt.point_idx + 1}</span>
+                    <span className={`text-sm font-semibold ${end.cls}`}>{end.text}</span>
+                  </div>
+
+                  {/* Key stats */}
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-zinc-400">
+                    <span>{pt.rally_hit_count} shot{pt.rally_hit_count !== 1 ? "s" : ""}</span>
+                    <span>{dur}s</span>
+                    {serveZone && <span>Serve · {serveZone}</span>}
+                    {server && <span className="text-zinc-500">{server} serving</span>}
+                  </div>
+
+                  {/* Coaching tip */}
+                  {card && (
+                    <div className="mt-auto pt-3 border-t border-zinc-800 space-y-1.5">
+                      <p className="text-sm text-zinc-300 leading-snug">{card.summary}</p>
+                      {card.suggestion && (
+                        <p className="text-sm text-green-400 leading-snug">{card.suggestion}</p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Jump to point in overlay */}
+                  <button
+                    onClick={() => onSeekToPoint(pt.start_sec)}
+                    className="mt-2 text-xs text-zinc-500 hover:text-green-400 transition-colors text-left"
+                  >
+                    Jump in match video →
+                  </button>
+                </div>
+              </div>
+            );
+          })}
         </div>
-      ))}
+      )}
     </div>
   );
 }

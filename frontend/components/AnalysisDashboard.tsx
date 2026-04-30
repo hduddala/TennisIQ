@@ -1,28 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import * as Plot from "@observablehq/plot";
 import type { AnalysisData, StatSummary } from "@/lib/types";
+import ShotsTable from "./ShotsTable";
 
-type Props = {
-  analysis: AnalysisData;
-};
+type Props = { analysis: AnalysisData };
 
 export default function AnalysisDashboard({ analysis }: Props) {
-  const quality = analysis.quality ?? {};
   const serve = analysis.serve ?? {};
   const rally = analysis.rally ?? {};
   const errors = analysis.errors ?? {};
   const players = analysis.players ?? {};
   const ball = analysis.ball ?? {};
-  const eventTimeline = useMemo(
-    () => analysis.events?.timeline ?? [],
-    [analysis.events]
-  );
-
-  const ballCoverage = quality.ball_coverage_pct ?? 0;
-  const homography = quality.homography_reliable_pct ?? 0;
-  const eventCount = quality.events_total ?? 0;
+  const shots = analysis.shots ?? {};
+  const shotTimeline = shots.timeline ?? [];
+  const shotMix = shots.mix ?? {};
 
   const ballSpeedKmH = useMemo(() => {
     const values = ball.speed_samples_m_s ?? [];
@@ -37,255 +30,199 @@ export default function AnalysisDashboard({ analysis }: Props) {
   const serveZones = serve.zone_counts ?? {};
   const serveSamples = serve.sample_count ?? 0;
 
-  const hitDeltas = useMemo(() => ball.hit_speed_deltas ?? [], [ball.hit_speed_deltas]);
-  const avgHitDelta = useMemo(() => {
-    const vals = hitDeltas
-      .map((d) => d.delta)
-      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
-    if (!vals.length) return null;
-    return vals.reduce((a, b) => a + b, 0) / vals.length;
-  }, [hitDeltas]);
+  const hasServeData = serveSamples > 0 || Object.keys(serveZones).length > 0;
+  const hasRallyData = rallyHits.length > 0 || Object.keys(rallyReasons).length > 0;
+  const hasPlayerData =
+    (players.player_a?.distance_m ?? 0) > 0 || (players.player_b?.distance_m ?? 0) > 0;
+  const hasBallData = ballSpeedKmH.length > 0 || ball.speed_stats?.mean != null;
+  const hasErrorData = (errors.out_count ?? 0) > 0;
+  const hasShotData = shotTimeline.length > 0 || shotMix.player_a != null || shotMix.player_b != null;
 
-  const [logOpen, setLogOpen] = useState(false);
-  const [filterType, setFilterType] = useState<string>("all");
-  const [filterSide, setFilterSide] = useState<string>("all");
-  const [filterPlayer, setFilterPlayer] = useState<string>("all");
-
-  const filteredTimeline = useMemo(() => {
-    return eventTimeline.filter((e) => {
-      if (filterType !== "all" && e.type !== filterType) return false;
-      if (filterSide !== "all" && e.side !== filterSide) return false;
-      if (filterPlayer !== "all" && e.player !== filterPlayer) return false;
-      return true;
-    });
-  }, [eventTimeline, filterType, filterSide, filterPlayer]);
+  if (!hasServeData && !hasRallyData && !hasPlayerData && !hasBallData && !hasShotData) {
+    return null;
+  }
 
   return (
     <section className="space-y-6">
-      <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm font-semibold text-zinc-200">Quality & Coverage</h3>
-          <div className="text-xs text-zinc-500">Always-on confidence</div>
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-          <CoverageBadge label="Ball coverage" value={ballCoverage} warnBelow={40} suffix="%" />
-          <CoverageBadge label="Homography" value={homography} warnBelow={85} suffix="%" />
-          <CoverageBadge label="Events" value={eventCount} warnBelow={3} suffix="" />
-          <CoverageBadge label="Points" value={quality.points_total ?? 0} warnBelow={1} suffix="" />
-        </div>
-      </div>
+      <h2 className="text-base font-bold text-white">Match Stats</h2>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-200">Serve Quality</h3>
-          <div className="text-xs text-zinc-500">
-            Fault rate: {formatPercent(serve.fault_rate)} · samples: {serveSamples}
+      {/* Serve Analysis */}
+      {hasServeData && (
+        <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-semibold text-white">Serve Analysis</h3>
+              {serveSamples > 0 && (
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  {serveSamples} serve{serveSamples !== 1 ? "s" : ""} tracked
+                  {serve.fault_rate != null && serve.fault_rate > 0
+                    ? ` · ${Math.round(serve.fault_rate * 100)}% fault rate`
+                    : ""}
+                </p>
+              )}
+            </div>
           </div>
-          <KeyValueGrid
-            items={[
-              { label: "Depth mean (m)", value: statValue(serve.depth_stats, "mean") },
-              { label: "Width mean (m)", value: statValue(serve.width_stats, "mean") },
-              { label: "Depth p95 (m)", value: statValue(serve.depth_stats, "p95") },
-              { label: "Width p95 (m)", value: statValue(serve.width_stats, "p95") },
-            ]}
-          />
+
           {Object.keys(serveZones).length > 0 && (
-            <div className="flex flex-wrap gap-2 text-[11px] text-zinc-400">
+            <div className="flex flex-wrap gap-2">
               {Object.entries(serveZones).map(([zone, count]) => (
-                <span key={zone} className="px-2 py-1 rounded-md bg-zinc-800 text-zinc-200">
-                  {zone.replace("_", " ")}: {count}
+                <span
+                  key={zone}
+                  className="px-3 py-1.5 rounded-xl bg-zinc-800 text-sm text-zinc-200"
+                >
+                  {zone.replace(/_/g, " ")} <span className="text-zinc-500 ml-1">{String(count)}</span>
                 </span>
               ))}
             </div>
           )}
-          {serveSamples < 3 ? (
-            <div className="text-[11px] text-zinc-500">Too few serves for charts (need 3+).</div>
-          ) : (
+
+          {serveSamples >= 3 && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <PlotHistogram
-                values={serveDepth}
-                title="Serve depth (m)"
-                xLabel="meters from service line"
-              />
-              <PlotHistogram
-                values={serveWidth}
-                title="Serve width (m)"
-                xLabel="meters from center"
-              />
+              <PlotHistogram values={serveDepth} title="Serve depth" xLabel="meters" />
+              <PlotHistogram values={serveWidth} title="Serve width" xLabel="meters from center" />
             </div>
           )}
         </div>
+      )}
 
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-200">Rally Structure</h3>
-          {eventCount < 3 && (
-            <div className="text-xs text-yellow-400">Low event count: tempo charts may be unreliable.</div>
-          )}
-          {rallyHits.length < 5 ? (
-            <div className="text-[11px] text-zinc-500">Too few rallies for charts (need 5+).</div>
-          ) : (
-            <>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <PlotHistogram values={rallyHits} title="Rally hits" xLabel="hits per rally" />
+      {/* Rally Breakdown */}
+      {hasRallyData && (
+        <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+          <h3 className="text-sm font-semibold text-white">Rally Breakdown</h3>
+
+          {rallyHits.length >= 5 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <PlotHistogram values={rallyHits} title="Shots per rally" xLabel="shots" />
+              {Object.keys(rallyReasons).length > 0 && (
                 <PlotBar
-                  title="End reasons"
-                  data={Object.entries(rallyReasons).map(([key, value]) => ({ key, value }))}
+                  title="How points ended"
+                  data={Object.entries(rallyReasons).map(([key, value]) => ({
+                    key: key.replace(/_/g, " ").toLowerCase(),
+                    value,
+                  }))}
                 />
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <PlotHistogram values={rallyDurations} title="Rally duration (s)" xLabel="seconds" />
-              </div>
-            </>
-          )}
-          <KeyValueGrid
-            items={[
-              { label: "Hits/sec (mean)", value: formatNumber(rally.tempo_stats?.mean_hits_per_sec) },
-              { label: "Inter-hit mean (s)", value: formatNumber(rally.tempo_stats?.mean_inter_hit_sec, 3) },
-              { label: "Inter-hit p95 (s)", value: formatNumber(rally.tempo_stats?.p95_inter_hit_sec, 3) },
-            ]}
-          />
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-200">Errors</h3>
-          <KeyValueGrid
-            items={[
-              { label: "Out count", value: formatNumber(errors.out_count ?? 0) },
-              { label: "Out dist mean (m)", value: statValue(errors.out_distance_stats, "mean") },
-              { label: "Out dist p95 (m)", value: statValue(errors.out_distance_stats, "p95") },
-            ]}
-          />
-        </div>
-
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-200">Player Movement</h3>
-          <PlayerStats label="Player A" stats={players.player_a ?? null} />
-          <PlayerStats label="Player B" stats={players.player_b ?? null} />
-        </div>
-
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-200">Ball Pace</h3>
-          {ballCoverage < 40 ? (
-            <div className="text-xs text-yellow-400">Low ball coverage: summary only.</div>
-          ) : ballSpeedKmH.length < 5 ? (
-            <div className="text-xs text-zinc-500">Too few speed samples for histogram (need 5+).</div>
-          ) : (
-            <PlotHistogram values={ballSpeedKmH} title="Ball speed (km/h)" xLabel="km/h" />
-          )}
-          <KeyValueGrid
-            items={[
-              { label: "Speed mean (m/s)", value: statValue(ball.speed_stats, "mean") },
-              { label: "Speed p95 (m/s)", value: statValue(ball.speed_stats, "p95") },
-              { label: "Hit delta mean (m/s)", value: formatNumber(avgHitDelta, 2) },
-            ]}
-          />
-        </div>
-      </div>
-
-      <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-zinc-200">Atomic Event Log</h3>
-          <div className="flex items-center gap-2 text-xs text-zinc-500">
-            <span>{filteredTimeline.length}/{eventTimeline.length} events</span>
-            <button
-              onClick={() => setLogOpen((v) => !v)}
-              className="px-2 py-1 rounded bg-zinc-800 text-[11px] hover:bg-zinc-700"
-            >
-              {logOpen ? "Hide" : "Show"}
-            </button>
-          </div>
-        </div>
-        {logOpen && (
-          <>
-            <div className="flex flex-wrap gap-2 text-[11px] text-zinc-400">
-              <select
-                value={filterType}
-                onChange={(e) => setFilterType(e.target.value)}
-                className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1"
-              >
-                <option value="all">All types</option>
-                <option value="hit">Hit</option>
-                <option value="bounce">Bounce</option>
-              </select>
-              <select
-                value={filterSide}
-                onChange={(e) => setFilterSide(e.target.value)}
-                className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1"
-              >
-                <option value="all">All sides</option>
-                <option value="near">Near</option>
-                <option value="far">Far</option>
-              </select>
-              <select
-                value={filterPlayer}
-                onChange={(e) => setFilterPlayer(e.target.value)}
-                className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1"
-              >
-                <option value="all">All players</option>
-                <option value="player_a">Player A</option>
-                <option value="player_b">Player B</option>
-              </select>
+              )}
             </div>
-            {filteredTimeline.length === 0 ? (
-              <div className="text-xs text-zinc-500">No events match the filters.</div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs text-zinc-400">
-                  <thead className="text-[11px] uppercase tracking-wide text-zinc-500">
-                    <tr>
-                      <th className="py-2 px-2 text-left">Time</th>
-                      <th className="py-2 px-2 text-left">Type</th>
-                      <th className="py-2 px-2 text-left">Side</th>
-                      <th className="py-2 px-2 text-left">In/Out</th>
-                      <th className="py-2 px-2 text-left">Speed Δ</th>
-                      <th className="py-2 px-2 text-left">Angle</th>
-                      <th className="py-2 px-2 text-left">Player</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-zinc-800">
-                    {filteredTimeline.map((evt, idx) => (
-                      <tr key={`${evt.t ?? idx}-${idx}`} className="hover:bg-zinc-950/60">
-                        <td className="py-2 px-2">{formatNumber(evt.t, 3)}s</td>
-                        <td className="py-2 px-2 text-zinc-200">{evt.type ?? "-"}</td>
-                        <td className="py-2 px-2">{evt.side ?? "-"}</td>
-                        <td className="py-2 px-2">{evt.in_out ?? "-"}</td>
-                        <td className="py-2 px-2">
-                          {formatSpeedDelta(evt.speed_before_m_s, evt.speed_after_m_s)}
-                        </td>
-                        <td className="py-2 px-2">{formatNumber(evt.direction_change_deg, 1)}</td>
-                        <td className="py-2 px-2">{evt.player ?? "-"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {rally.tempo_stats?.mean_hits_per_sec != null && (
+                <StatBubble
+                  label="Shots per second"
+                  value={formatNumber(rally.tempo_stats.mean_hits_per_sec)}
+                />
+              )}
+              {rallyHits.length > 0 && (
+                <StatBubble
+                  label="Avg rally length"
+                  value={`${formatNumber(rallyHits.reduce((a, b) => a + b, 0) / rallyHits.length)} shots`}
+                />
+              )}
+              {rallyDurations.length > 0 && (
+                <StatBubble
+                  label="Avg rally time"
+                  value={`${formatNumber(rallyDurations.reduce((a, b) => a + b, 0) / rallyDurations.length)}s`}
+                />
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Shot Types */}
+      {hasShotData && (
+        <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-white">Shot Types</h3>
+            {shotTimeline.length > 0 && (
+              <span className="text-xs text-zinc-500">{shotTimeline.length} shots logged</span>
             )}
-          </>
-        )}
-      </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <ShotMixCard title="Player A" data={shotMix.player_a} />
+            <ShotMixCard title="Player B" data={shotMix.player_b} />
+          </div>
+          {shotTimeline.length > 0 && <ShotsTable shots={shotTimeline} />}
+        </div>
+      )}
+
+      {/* Movement + Errors + Ball Speed */}
+      {(hasErrorData || hasPlayerData || hasBallData) && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {hasErrorData && (
+            <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-5 space-y-3">
+              <h3 className="text-sm font-semibold text-white">Errors</h3>
+              <StatBubble label="Balls hit out" value={String(errors.out_count ?? 0)} />
+            </div>
+          )}
+
+          {hasPlayerData && (
+            <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-5 space-y-3">
+              <h3 className="text-sm font-semibold text-white">Court Coverage</h3>
+              <PlayerMovement label="Player A" stats={players.player_a ?? null} />
+              <PlayerMovement label="Player B" stats={players.player_b ?? null} />
+            </div>
+          )}
+
+          {hasBallData && (
+            <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-5 space-y-3">
+              <h3 className="text-sm font-semibold text-white">Ball Speed</h3>
+              {ballSpeedKmH.length >= 5 ? (
+                <PlotHistogram values={ballSpeedKmH} title="Speed distribution" xLabel="km/h" />
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  {ball.speed_stats?.mean != null && (
+                    <StatBubble
+                      label="Avg speed"
+                      value={`${Math.round(ball.speed_stats.mean * 3.6)} km/h`}
+                    />
+                  )}
+                  {ball.speed_stats?.p95 != null && (
+                    <StatBubble
+                      label="Top speed"
+                      value={`${Math.round(ball.speed_stats.p95 * 3.6)} km/h`}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </section>
   );
 }
 
-function CoverageBadge({
+function StatBubble({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl bg-zinc-800/60 border border-zinc-800 px-3 py-3">
+      <div className="text-[11px] text-zinc-500 mb-1">{label}</div>
+      <div className="text-lg font-bold text-white">{value}</div>
+    </div>
+  );
+}
+
+function PlayerMovement({
   label,
-  value,
-  warnBelow,
-  suffix,
+  stats,
 }: {
   label: string;
-  value: number;
-  warnBelow: number;
-  suffix: string;
+  stats: { distance_m?: number; speed_stats?: StatSummary | null; zone_time_pct?: Record<string, number> | null } | null;
 }) {
-  const isWarn = value < warnBelow;
-  const color = isWarn ? "text-yellow-300 bg-yellow-950 border-yellow-800" : "text-emerald-300 bg-emerald-950 border-emerald-800";
+  if (!stats || !stats.distance_m) return null;
+  const zones = stats.zone_time_pct;
   return (
-    <div className={`border rounded-lg px-3 py-2 ${color}`}>
-      <div className="text-[11px] uppercase tracking-wide">{label}</div>
-      <div className="text-sm font-semibold">{formatNumber(value)}{suffix}</div>
+    <div className="space-y-1.5">
+      <p className="text-sm font-medium text-zinc-300">{label}</p>
+      <p className="text-sm text-zinc-400">
+        Covered <span className="text-white font-semibold">{Math.round(stats.distance_m)}m</span>
+      </p>
+      {zones && (
+        <div className="flex gap-3 text-xs text-zinc-500">
+          {Object.entries(zones).map(([zone, pct]) => (
+            <span key={zone}>{zone}: {formatNumber(pct)}%</span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -325,7 +262,7 @@ function PlotHistogram({
   }, [values, xLabel]);
 
   return (
-    <div className="rounded-lg bg-zinc-950 border border-zinc-800 p-3">
+    <div className="rounded-xl bg-zinc-950 border border-zinc-800 p-3">
       <div className="text-xs text-zinc-400 mb-2">{title}</div>
       <div ref={ref} />
     </div>
@@ -364,78 +301,58 @@ function PlotBar({
   }, [data]);
 
   return (
-    <div className="rounded-lg bg-zinc-950 border border-zinc-800 p-3">
+    <div className="rounded-xl bg-zinc-950 border border-zinc-800 p-3">
       <div className="text-xs text-zinc-400 mb-2">{title}</div>
       <div ref={ref} />
     </div>
   );
 }
 
-function PlayerStats({
-  label,
-  stats,
+function ShotMixCard({
+  title,
+  data,
 }: {
-  label: string;
-  stats: { distance_m?: number; speed_stats?: StatSummary | null; zone_time_pct?: Record<string, number> | null } | null;
+  title: string;
+  data?: { counts?: Record<string, number>; pct?: Record<string, number> };
 }) {
-  if (!stats) {
-    return (
-      <div className="text-xs text-zinc-500">{label}: no data</div>
-    );
-  }
+  const entries = data?.counts ? Object.entries(data.counts) : [];
+  if (!entries.length) return null;
+  const max = Math.max(...entries.map(([, v]) => v));
   return (
-    <div className="text-xs text-zinc-400 space-y-1">
-      <div className="text-zinc-200 font-semibold">{label}</div>
-      <div>Distance: {formatNumber(stats.distance_m)} m</div>
-      <div>Speed mean: {statValue(stats.speed_stats, "mean")} m/s</div>
-      {stats.zone_time_pct && (
-        <div className="flex gap-2">
-          {Object.entries(stats.zone_time_pct).map(([key, value]) => (
-            <span key={key} className="text-[11px] text-zinc-500">
-              {key}: {formatNumber(value)}%
-            </span>
-          ))}
-        </div>
-      )}
+    <div className="rounded-xl bg-zinc-950 border border-zinc-800 p-3 space-y-2">
+      <div className="text-xs text-zinc-400 font-medium">{title}</div>
+      <div className="space-y-1.5">
+        {entries.map(([shot, count]) => {
+          const pct = data?.pct?.[shot];
+          const width = max > 0 ? Math.max(8, (count / max) * 100) : 0;
+          return (
+            <div key={shot} className="flex items-center gap-2 text-sm">
+              <div className="w-24 capitalize text-zinc-300">{shot}</div>
+              <div className="flex-1 h-2 rounded-full bg-zinc-800">
+                <div className="h-2 rounded-full bg-green-500" style={{ width: `${width}%` }} />
+              </div>
+              <div className="w-6 text-right text-zinc-400 text-xs">{count}</div>
+              {pct !== undefined && (
+                <div className="w-10 text-right text-zinc-500 text-xs">{pct}%</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-function KeyValueGrid({ items }: { items: { label: string; value: string }[] }) {
-  return (
-    <div className="grid grid-cols-2 gap-2 text-xs text-zinc-400">
-      {items.map((item) => (
-        <div key={item.label} className="flex justify-between gap-2">
-          <span>{item.label}</span>
-          <span className="text-zinc-200">{item.value}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function formatNumber(value?: number | null, decimals: number = 1) {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+function formatNumber(value?: number | null, decimals = 1) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "–";
   return value.toFixed(decimals);
-}
-
-function formatPercent(value?: number | null) {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  return `${(value * 100).toFixed(0)}%`;
-}
-
-function statValue(stats?: StatSummary | null, key?: keyof StatSummary) {
-  if (!stats || !key) return "-";
-  const val = stats[key];
-  if (val === null || val === undefined || Number.isNaN(val)) return "-";
-  return typeof val === "number" ? val.toFixed(2) : "-";
 }
 
 const plotStyle = {
   background: "transparent",
   color: "#e5e7eb",
   fontSize: "11px",
-};
+} as const;
 
 function formatSpeedDelta(before?: number | null, after?: number | null) {
   if (before === null || after === null || before === undefined || after === undefined) return "-";

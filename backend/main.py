@@ -21,9 +21,23 @@ from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
 
 try:
-    from analysis import build_analysis, write_analysis_bundle, rebuild_analytics, rebuild_player_cards, rebuild_match_flow
+    from analysis import (
+        build_analysis,
+        write_analysis_bundle,
+        rebuild_analytics,
+        rebuild_player_cards,
+        rebuild_match_flow,
+        generate_insights,
+    )
 except ModuleNotFoundError:
-    from backend.analysis import build_analysis, write_analysis_bundle, rebuild_analytics, rebuild_player_cards, rebuild_match_flow
+    from backend.analysis import (
+        build_analysis,
+        write_analysis_bundle,
+        rebuild_analytics,
+        rebuild_player_cards,
+        rebuild_match_flow,
+        generate_insights,
+    )
 
 import db
 import modal_runner
@@ -693,19 +707,52 @@ async def get_results_data(job_id: str):
     if not data["error_heatmap"] and data["events"]:
         data["error_heatmap"] = _generate_error_heatmap_from_events(data["events"])
 
-    pa_heatmap = _load_json("visuals/player_a_heatmap.json")
-    pb_heatmap = _load_json("visuals/player_b_heatmap.json")
-    if pa_heatmap:
-        data["player_a_heatmap"] = pa_heatmap
-    if pb_heatmap:
-        data["player_b_heatmap"] = pb_heatmap
+    # Always try to rebuild player heatmaps from full timeseries (which has ALL frames
+    # from ALL segments, unlike the per-segment heatmap files which only cover ~1 segment).
+    ts_a = _load_json("timeseries/player_a_court.json")
+    ts_b = _load_json("timeseries/player_b_court.json")
 
-    if not pa_heatmap or not pb_heatmap:
-        coverage = _load_json("visuals/player_coverage.json")
-        if coverage:
-            if not pa_heatmap and "player_a" in coverage:
+    cached_pa = _load_json("visuals/player_a_heatmap_full_v2.json")
+    cached_pb = _load_json("visuals/player_b_heatmap_full_v2.json")
+
+    # Use cached full-timeseries heatmap if already built, otherwise recompute
+    if cached_pa:
+        data["player_a_heatmap"] = cached_pa
+    elif ts_a:
+        hm = _timeseries_to_heatmap(ts_a)
+        data["player_a_heatmap"] = hm
+        try:
+            (run_dir / "visuals" / "player_a_heatmap_full_v2.json").write_text(json.dumps(hm))
+        except OSError:
+            pass
+
+    if cached_pb:
+        data["player_b_heatmap"] = cached_pb
+    elif ts_b:
+        hm = _timeseries_to_heatmap(ts_b)
+        data["player_b_heatmap"] = hm
+        try:
+            (run_dir / "visuals" / "player_b_heatmap_full_v2.json").write_text(json.dumps(hm))
+        except OSError:
+            pass
+
+    # Fall back to segment-level heatmap files if timeseries not available
+    if not data["player_a_heatmap"]:
+        pa_heatmap = _load_json("visuals/player_a_heatmap.json")
+        if pa_heatmap:
+            data["player_a_heatmap"] = pa_heatmap
+        else:
+            coverage = _load_json("visuals/player_coverage.json")
+            if coverage and "player_a" in coverage:
                 data["player_a_heatmap"] = _positions_to_heatmap(coverage["player_a"], "Player A")
-            if not pb_heatmap and "player_b" in coverage:
+
+    if not data["player_b_heatmap"]:
+        pb_heatmap = _load_json("visuals/player_b_heatmap.json")
+        if pb_heatmap:
+            data["player_b_heatmap"] = pb_heatmap
+        else:
+            coverage = _load_json("visuals/player_coverage.json")
+            if coverage and "player_b" in coverage:
                 data["player_b_heatmap"] = _positions_to_heatmap(coverage["player_b"], "Player B")
 
     ball_heatmap = _load_json("visuals/ball_heatmap.json")
@@ -1057,6 +1104,87 @@ def _generate_error_heatmap_from_events(events: list) -> dict | None:
     }
 
 
+def _timeseries_to_heatmap(timeseries: list) -> dict:
+    """
+    Build a full-match player heatmap from a timeseries JSON list.
+
+    Uses fixed court-reference coordinate bounds so cells align perfectly with the
+    SVG court diagram.  Automatically detects each player's primary court half (near
+    vs far of the net at Y=1748) from the median Y position and filters out frames
+    on the wrong side — this prevents cross-court bleed from tracking noise.
+    """
+    import numpy as np
+
+    COURT_X_MIN, COURT_X_MAX = 286, 1379
+    COURT_Y_MIN, COURT_Y_MAX = 561, 2935
+    NET_Y = 1748
+    # Allow up to ~2.5 m past the net so genuine approach-shot positions are kept.
+    NET_TOLERANCE = 270
+    # After 2D histogram, zero cells whose center lies clearly on the opponent's half.
+    HALF_MASK_SLACK = 55
+
+    # Collect all raw positions
+    raw_xs, raw_ys = [], []
+    for frame in timeseries:
+        if not isinstance(frame, dict):
+            continue
+        x, y = frame.get("x"), frame.get("y")
+        if x is not None and y is not None:
+            raw_xs.append(float(x))
+            raw_ys.append(float(y))
+
+    if not raw_xs:
+        return {"grid": [], "x_edges": [], "y_edges": [], "total_frames": 0}
+
+    # Determine player's primary court half from median Y.
+    median_y = float(np.median(raw_ys))
+    near_side = median_y >= NET_Y          # near side: Y ≥ NET_Y (baseline end of frame)
+
+    xs, ys = [], []
+    for x, y in zip(raw_xs, raw_ys):
+        if near_side:
+            # Keep near-side positions; allow up to NET_TOLERANCE past net
+            if y < NET_Y - NET_TOLERANCE:
+                continue
+        else:
+            # Keep far-side positions; allow up to NET_TOLERANCE past net
+            if y > NET_Y + NET_TOLERANCE:
+                continue
+        # Clamp to court bounds
+        x = max(COURT_X_MIN, min(COURT_X_MAX, x))
+        y = max(COURT_Y_MIN, min(COURT_Y_MAX, y))
+        xs.append(x)
+        ys.append(y)
+
+    if not xs:
+        return {"grid": [], "x_edges": [], "y_edges": [], "total_frames": 0}
+
+    # 20×36 bins ≈ 55×66 court-units per cell ≈ 0.5 m × 0.6 m — good resolution
+    x_bins = np.linspace(COURT_X_MIN, COURT_X_MAX, 21)
+    y_bins = np.linspace(COURT_Y_MIN, COURT_Y_MAX, 37)
+
+    grid, x_edges, y_edges = np.histogram2d(xs, ys, bins=[x_bins, y_bins])
+    grid = np.asarray(grid, dtype=float)
+    ny_bins = len(y_edges) - 1
+    nx_bins = len(x_edges) - 1
+    for i in range(nx_bins):
+        for j in range(ny_bins):
+            y_center = (float(y_edges[j]) + float(y_edges[j + 1])) / 2.0
+            if near_side:
+                if y_center < NET_Y - HALF_MASK_SLACK:
+                    grid[i, j] = 0.0
+            else:
+                if y_center > NET_Y + HALF_MASK_SLACK:
+                    grid[i, j] = 0.0
+    return {
+        "grid": grid.tolist(),
+        "x_edges": x_edges.tolist(),
+        "y_edges": y_edges.tolist(),
+        "total_frames": len(xs),
+        "primary_side": "near" if near_side else "far",
+    }
+
+
 def _positions_to_heatmap(positions: list, label: str) -> dict:
     """Convert raw [x,y] position arrays into HeatmapData grid format."""
     import numpy as np
@@ -1150,6 +1278,163 @@ class SessionSave(BaseModel):
     """FR-47: Manually save a session record with custom preferences."""
     coach_id: Optional[str] = "default"
     preferences: Optional[dict] = None
+
+
+@app.get("/insights/{job_id}")
+async def get_insights(job_id: str):
+    """
+    Generate (and cache) AI coaching insights for a completed job.
+
+    Rule-based engine always runs. If OPENAI_API_KEY is set the insights are
+    also enriched via GPT-4o and the result is cached to insights.json so
+    subsequent calls return instantly.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] not in ("complete", "error"):
+        raise HTTPException(status_code=202, detail="Pipeline still running.")
+
+    output_dir_name = job.get("output_dir") or job_id
+    run_dir = Path(outputs_abs) / output_dir_name
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Output directory not found.")
+
+    # Return cached insights if available
+    cache_path = run_dir / "insights.json"
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    def _load(rel: str):
+        p = run_dir / rel
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        return None
+
+    analysis = _load("analysis.json") or _load("analysis/analysis.json")
+    if analysis is None:
+        try:
+            analysis = build_analysis(run_dir, job_id=job_id)
+        except Exception:
+            analysis = {}
+
+    points = _load("points.json") or []
+    events = _load("events.json") or []
+
+    try:
+        insights = generate_insights(analysis or {}, points, events)
+    except Exception as exc:
+        logger.error("Insights generation failed for %s: %s", job_id, exc)
+        insights = {
+            "strengths": [], "issues": [], "patterns": [], "drills": [],
+            "priority": "Analysis pending.",
+            "coach_summary": "Unable to generate insights — try again once processing completes.",
+            "data_points": {},
+        }
+
+    # Optional: enrich with OpenAI GPT-4o if API key is set
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key and points and analysis:
+        try:
+            insights = _enrich_with_llm(insights, analysis, points, events, openai_key)
+            insights["_source"] = "gpt"
+        except Exception as exc:
+            logger.warning("LLM enrichment failed, using rule-based insights: %s", exc)
+            insights["_source"] = "rule_based"
+    else:
+        insights["_source"] = "rule_based"
+
+    # Cache to disk
+    try:
+        cache_path.write_text(json.dumps(insights, indent=2))
+    except OSError:
+        pass
+
+    return insights
+
+
+def _enrich_with_llm(
+    rule_insights: dict,
+    analysis: dict,
+    points: list,
+    events: list,
+    api_key: str,
+) -> dict:
+    """Call GPT-4o to refine rule-based insights with richer natural language."""
+    try:
+        import openai
+    except ImportError:
+        return rule_insights
+
+    client = openai.OpenAI(api_key=api_key)
+
+    # Build a concise data summary for the prompt
+    rally = analysis.get("rally") or {}
+    serve = analysis.get("serve") or {}
+    ball = analysis.get("ball") or {}
+    players_data = analysis.get("players") or {}
+    n_points = len(points)
+    rally_hits_list = rally.get("rally_hits") or []
+    avg_rally = round(sum(rally_hits_list) / len(rally_hits_list), 1) if rally_hits_list else 0
+    end_reasons = [p.get("end_reason") for p in points if isinstance(p, dict)]
+    out_rate = round(end_reasons.count("OUT") / n_points * 100) if n_points else 0
+    pa_dist = round((players_data.get("player_a") or {}).get("distance_m") or 0)
+    pb_dist = round((players_data.get("player_b") or {}).get("distance_m") or 0)
+    speed_stats = ball.get("speed_stats") or {}
+    avg_spd = round((speed_stats.get("mean") or 0) * 3.6)
+
+    data_summary = (
+        f"Points: {n_points} | Avg rally: {avg_rally} shots | "
+        f"Out error rate: {out_rate}% | "
+        f"Player A distance: {pa_dist}m | Player B distance: {pb_dist}m | "
+        f"Avg ball speed: {avg_spd} km/h | "
+        f"Serve zones: {serve.get('zone_counts', {})} | "
+        f"Fault rate: {round((serve.get('fault_rate') or 0)*100)}%"
+    )
+
+    existing = json.dumps({
+        "strengths": rule_insights.get("strengths", []),
+        "issues": rule_insights.get("issues", []),
+        "patterns": rule_insights.get("patterns", []),
+    }, indent=2)
+
+    prompt = f"""You are an expert tennis coach. Refine and improve these coaching insights for a player/coach dashboard.
+
+MATCH DATA:
+{data_summary}
+
+EXISTING RULE-BASED INSIGHTS (improve the language and add specificity):
+{existing}
+
+Return JSON with this exact structure:
+{{
+  "strengths": [{{"title": "...", "detail": "..."}}],
+  "issues": [{{"title": "...", "detail": "...", "evidence": "..."}}],
+  "patterns": [{{"title": "...", "detail": "..."}}],
+  "drills": [{{"name": "...", "description": "...", "targets": "..."}}],
+  "priority": "Single most important coaching focus right now",
+  "coach_summary": "2-3 sentence overall assessment a coach would give after reviewing this data"
+}}
+
+Be specific, data-backed, and actionable. Use real tennis coaching language. Max 4 items per category."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_tokens=1200,
+        temperature=0.4,
+    )
+    enriched = json.loads(response.choices[0].message.content)
+    # Merge: use LLM content but keep data_points from rule engine
+    enriched["data_points"] = rule_insights.get("data_points", {})
+    return enriched
 
 
 @app.post("/sessions/{job_id}/save")

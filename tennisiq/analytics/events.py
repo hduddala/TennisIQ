@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 # ─── Tunables ────────────────────────────────────────────────────────────────
 
 SMOOTH_WINDOW = 3
-MIN_SPEED_FOR_EVENT = 3.0          # m/s — ignore direction changes when ball barely moves
-DIRECTION_CHANGE_DEG = 50.0        # FR-23: minimum angle change for a hit candidate
-HIT_MIN_SPEED = 5.0                # m/s — minimum speed at the event frame for a hit
+MIN_SPEED_FOR_EVENT = 2.5          # m/s — ignore direction changes when ball barely moves
+DIRECTION_CHANGE_DEG = 40.0        # FR-23: minimum angle change for a hit candidate (lowered to catch softer direction changes)
+HIT_MIN_SPEED = 3.0                # m/s — minimum speed at the event frame for a hit (lowered to catch slower shots)
 NMS_WINDOW_FRAMES = 5              # temporal NMS: suppress duplicates within ±N frames
 PLAYER_PROXIMITY_UNITS = 350.0     # court-space distance to assign hit to player
 LINE_MARGIN_UNITS = 20.0           # FR-24: pixels within line counted as "line"
@@ -261,7 +261,7 @@ def _detect_hits(
     candidates: list[TennisEvent] = []
 
     for i in range(2, n - 2):
-        if _has_tracking_gap(ball_physics, i, radius=3):
+        if _has_tracking_gap(ball_physics, i, radius=2):
             continue
 
         dir_before = _avg_direction(directions, i, window=3, direction=-1)
