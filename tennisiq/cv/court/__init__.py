@@ -1,3 +1,3 @@
-from .inference import CourtDetector
+from .inference_resnet import CourtDetectorResNet
 
-__all__ = ["CourtDetector"]
+__all__ = ["CourtDetectorResNet"]

@@ -4,7 +4,6 @@ import type {
   ResultsDataResponse,
   PointReviewResponse,
   Session,
-  CoachNote,
 } from "./types";
 
 const ENV_API_URL = (process.env.NEXT_PUBLIC_API_URL || "").trim().replace(/\/+$/, "");
@@ -169,28 +168,4 @@ export async function getSession(sessionId: string): Promise<Session> {
 export async function getLatestSession(coachId?: string): Promise<Session> {
   const cid = coachId || "default";
   return apiFetch(`/sessions/latest/${encodeURIComponent(cid)}`);
-}
-
-export async function getCoachNotes(jobId: string): Promise<{ job_id: string; notes: CoachNote[] }> {
-  return apiFetchWithFallback(`/notes/${jobId}`, `/results/${jobId}/notes`);
-}
-
-export async function createCoachNote(
-  jobId: string,
-  pointIdx: number,
-  timestampSec: number,
-  noteText: string,
-  player: "player_a" | "player_b" = "player_a",
-): Promise<{ ok: boolean; id: number }> {
-  return apiFetchWithFallback(`/notes/${jobId}/${pointIdx}`, `/results/${jobId}/notes/${pointIdx}`, {
-    method: "POST",
-    body: JSON.stringify({ timestamp_sec: timestampSec, note_text: noteText, player }),
-  });
-}
-
-export async function deleteCoachNote(
-  jobId: string,
-  noteId: number,
-): Promise<{ ok: boolean }> {
-  return apiFetchWithFallback(`/notes/${jobId}/${noteId}`, `/results/${jobId}/notes/${noteId}`, { method: "DELETE" });
 }

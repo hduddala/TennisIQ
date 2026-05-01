@@ -444,16 +444,6 @@ export interface HistoricalInsights {
   player_b: PlayerHistoryInsights;
 }
 
-export interface CoachNote {
-  id: number;
-  job_id: string;
-  point_idx: number;
-  timestamp_sec: number;
-  note_text: string;
-  player: "player_a" | "player_b";
-  created_at: string;
-}
-
 export interface Session {
   id: string;
   coach_id: string;

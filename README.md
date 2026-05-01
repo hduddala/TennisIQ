@@ -63,10 +63,10 @@ TennisIQ/
   docs/readme/       # Screenshots for this README (safe to replace)
   frontend/          # Next.js + Tailwind (results dashboard)
   backend/           # FastAPI + SQLite (API + job orchestration)
-  tennisiq/          # CV pipeline (court, ball, player, events, points, output)
+  tennisiq/          # CV + Modal inference (court, ball, player, events, analytics)
   checkpoints/       # Model weights (not tracked in git)
   outputs/           # Pipeline results per job (not tracked in git)
-  modal_app.py       # Legacy Modal app (training pipeline)
+  deploy_modal.sh    # Deploy tennisiq/modal_court.py to Modal
 ```
 
 ---
